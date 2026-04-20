@@ -21,7 +21,7 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         q: (batch_size, seqlen, nheads, headdim)
         k: (batch_size, seqlen, nheads_k, headdim)
         v: (batch_size, seqlen, nheads_k, headdim)
-        dropout_p: float. Dropout probability (not supported in this implementation).
+        dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask.
@@ -38,6 +38,8 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         out: (batch_size, seqlen, nheads, headdim).
     """
     # Check unsupported features
+    if q.dtype not in (torch.float16, torch.float32):
+        raise ValueError("This Triton implementation only supports float16 and float32 dtypes")
     if window_size != (-1, -1):
         raise ValueError("Warning: sliding window attention is not supported in this Triton implementation")
     if alibi_slopes is not None:
@@ -57,9 +59,6 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
     # Validate input shapes
     batch_size, seq_len_q, n_heads_q, head_dim = q.shape
     _, seq_len_k, n_heads_k, _ = k.shape
-
-    if (not causal) and seq_len_q % BLOCK_SIZE != 0:
-        raise ValueError("Warning: Non-causal attention only works with block sizes divisible by 128 in this Triton implementation")
 
     # Save original sequence lengths for unpadding later
     original_seq_len_q = seq_len_q
@@ -106,7 +105,7 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         softmax_scale = 1.0 / math.sqrt(head_dim)
     
     # Call the Triton implementation
-    out = attention(q, k, v, causal, softmax_scale)
+    out = attention(q, k, v, causal, softmax_scale, dropout_p, seq_len_k=original_seq_len_k)
     
     # Transpose the output back to the expected shape [batch, seq_len, heads, head_dim]
     out = out.transpose(1, 2).contiguous()  # Ensure output is contiguous
@@ -128,7 +127,7 @@ def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=Fal
     
     Arguments:
         qkv: (batch_size, seqlen, 3, nheads, headdim)
-        dropout_p: float. Dropout probability (not supported in this implementation).
+        dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask.
@@ -165,7 +164,7 @@ def flash_attn_kvpacked_func(q, kv, dropout_p=0.0, softmax_scale=None, causal=Fa
     Arguments:
         q: (batch_size, seqlen_q, nheads, headdim)
         kv: (batch_size, seqlen_k, 2, nheads_k, headdim)
-        dropout_p: float. Dropout probability (not supported in this implementation).
+        dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask.
@@ -233,8 +232,6 @@ class FlashAttention(torch.nn.Module):
         super().__init__()
         self.dropout_p = attention_dropout
         self.softmax_scale = softmax_scale
-        if attention_dropout > 0.0:
-            print("Warning: dropout is not supported in this Triton implementation")
     
     def forward(self, q, k, v, causal=False, attn_bias=None):
         """

@@ -21,12 +21,14 @@ setuptools.setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: OS Independent",
     ],
+    # https://research.google.com/colaboratory/runtime-version-faq.html
+    # Using Colab's Runtime 2025.7 version.
     packages=setuptools.find_packages(),
-    python_requires=">=3.8",
+    python_requires=">=3.11", # Python 3.11.13
     install_requires=[
         "einops",
-        "torch>=2.6.0",
-        "triton>=3.2.0",
+        "torch==2.6.0", # torch==2.8.0 (2025.10) and torch==2.5.1 (AutoDL) known to fail.
+        "triton==3.2.0", # Turing support is dropped in 3.3. 
         "packaging",
         "pytest"
     ],

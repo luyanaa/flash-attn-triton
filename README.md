@@ -1,26 +1,11 @@
 # Flash Attention Triton
 
-This repository provides a wrapper for the Triton implementation of the Flash Attention algorithm with a Flash Attention 2 compatible API. It allows for a drop-in replacement of the original Flash Attention 2 package for supported functionality. This package provides support for Turing (eg. 2080 Ti, T4) GPUs not supported by the original FA2 CUDA package.
-
-## Installation
-
-You can install the package directly from GitHub:
-
-```bash
-pip install git+https://github.com/rationalism/flash-attn-triton.git
-```
-
-Or from PyPI:
-
-```bash
-pip install flash-attn-triton
-```
+This repository provides a wrapper for the Triton implementation of the Flash Attention algorithm with a Flash Attention 2 compatible API. It allows for a drop-in replacement of the original Flash Attention 2 package for supported functionality. This package provides support for Volta (eg. V100, Titan V) and Turing (eg. 2080 Ti, T4) GPUs not supported by the original FA2 CUDA package.
 
 ## Requirements
-
-- PyTorch 2.6 or later
-- Triton 3.2 or later
-- CUDA-compatible GPU (compute capability 7.5+)
+- PyTorch 2.6, Triton 3.2 (last Turing-compatible Triton.)
+- CUDA Toolkit 12.8 system-wide (https://github.com/googlecolab/backend-info#202507) 
+- CUDA-compatible GPU (compute capability 7.0+)
 
 ## Usage
 
@@ -43,63 +28,19 @@ out = flash_attn(q, k, v, causal=True)
 ## Currently Supported Features
 
 - Basic attention mechanism (forward and backward)
-- FP16 and BF16 (BF16 only on Ampere and above)
-- Causal masking
+- FP16 (accumulated into FP32) on Turing and Volta GPUs.
+- Causal and non-causal masking
 - Softmax scaling
 - Basic MQA/GQA support (via tensor repetition)
-- Head dims 16, 32, 64, 128
-- Ampere, Turing cards
+- Head dims 16, 32, 64, 128, 256
 
 ## Limitations
 
 This implementation does not currently support:
-
-- Non-causal attention for sequence lengths not divisible by 128
-- Dropout (in progress)
-- Volta, Pascal, and earlier cards (in progress)
 - varlen/unpadded support
-- Attention bias
-- Sliding window attention
-- ALiBi
-- KV caching with in-place updates
-- Softcapping
-- Deterministic backward pass
+- Attention bias, ALiBi, Sliding window attention
 
 ## Benchmarks
-
-### RTX 3090 (Ampere)
-
-```
-fused-attention-batch4-head32-d64-fwd-causal=True-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      48.049147
-1   2048.0      61.062769
-2   4096.0      68.363188
-3   8192.0      70.768167
-4  16384.0      72.332634
-fused-attention-batch4-head32-d64-fwd-causal=False-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      60.190653
-1   2048.0      71.126662
-2   4096.0      69.049310
-3   8192.0      74.579215
-4  16384.0      73.911621
-fused-attention-batch4-head32-d64-bwd-causal=True-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      33.531732
-1   2048.0      40.884683
-2   4096.0      45.627974
-3   8192.0      47.449394
-4  16384.0      48.993511
-fused-attention-batch4-head32-d64-bwd-causal=False-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      42.834959
-1   2048.0      46.382862
-2   4096.0      49.984253
-3   8192.0      51.358497
-4  16384.0      49.913040
-```
-
 ### RTX 2080 Ti (Turing)
 
 ```
