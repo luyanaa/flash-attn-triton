@@ -75,6 +75,32 @@ fused-attention-batch4-head32-d64-bwd-causal=False-dropout=0.0:
 4  16384.0      32.614130
 ```
 
+### NVIDIA T4 (Turing) — vs PyTorch SDPA
+
+Measured on a Colab T4 with the pinned torch 2.6.0+cu124 / Triton 3.2.0, FP16, batch 4, 32 heads, head dim 64. Latency is the mean over 30 iterations after warmup; TFLOPS uses the standard fused-attention accounting (4·B·H·S²·D, causal ×0.5, backward ×2.5).
+
+**Mid/large sequence lengths** (typical LLM inference/training range) are faster than PyTorch `scaled_dot_product_attention`:
+
+| N_CTX | mode | ours (ms) | SDPA (ms) | ours (TFLOP/s) | SDPA (TFLOP/s) | speedup |
+|------:|:----:|----------:|----------:|---------------:|---------------:|--------:|
+|  2048 | cfwd |     5.229 |     5.710 |          13.14 |          12.03 |    1.09 |
+|  2048 | fwd  |     7.773 |    10.543 |          17.68 |          13.04 |    1.36 |
+|  4096 | cfwd |    15.756 |    21.342 |          17.45 |          12.88 |    1.35 |
+|  4096 | fwd  |    26.243 |    40.620 |          20.95 |          13.53 |    1.55 |
+|  2048 | cbwd |    19.441 |    25.973 |           8.84 |           6.61 |    1.34 |
+|  4096 | cbwd |    67.089 |    93.872 |          10.24 |           7.32 |    1.40 |
+
+**Short sequence lengths** — per-call GPU→CPU synchronization (ALiBi detection and dropout-seed generation) was removed from the hot path, giving a 1.2–2.5× forward improvement:
+
+| N_CTX | before (ms) | after (ms) | speedup |
+|------:|------------:|-----------:|--------:|
+|   128 |       0.722 |      0.378 |    1.9× |
+|   256 |       0.923 |      0.371 |    2.5× |
+|   512 |       1.029 |      0.597 |    1.7× |
+|  1024 |       2.103 |      1.749 |    1.2× |
+
+At N_CTX ≤ 256 the Triton kernel remains overhead-bound relative to SDPA (≈0.2–0.33×); the fused path is intended for mid/large sequence lengths.
+
 ## Acknowledgements
 
 This implementation is based on the Triton attention implementation from the original Flash Attention 2 repository by TriDao and the Triton tutorial on fused attention.

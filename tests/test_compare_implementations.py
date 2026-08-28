@@ -128,9 +128,20 @@ def test_cross_attention_bias_matches_sdpa():
     q, k, v = _inputs(batch=2, q_len=7, k_len=13)
     generator = torch.Generator(device=DEVICE).manual_seed(11)
     attn_bias = torch.randn(2, 2, 7, 13, device=DEVICE,
-                            dtype=torch.float32, generator=generator) * 0.1
+                            dtype=torch.float16, generator=generator) * 0.1
     output = flash_attn_func_cross(q, k, v, attn_bias=attn_bias)
     expected = _sdpa(q, k, v, attn_mask=attn_bias)
+    torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_alibi_slopes_matches_sdpa_bias():
+    q, k, v = _inputs(batch=2, q_len=17, k_len=17)
+    slopes = torch.randn(2, 2, device=DEVICE, dtype=torch.float32).abs() * 0.1
+    output = flash_attn_func(q, k, v, causal=False, alibi_slopes=slopes)
+    q_pos = torch.arange(17, device=DEVICE)[:, None]
+    k_pos = torch.arange(17, device=DEVICE)[None, :]
+    bias = (-slopes[:, :, None, None] * (q_pos - k_pos).abs()).half()
+    expected = _sdpa(q, k, v, attn_mask=bias)
     torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
 
 

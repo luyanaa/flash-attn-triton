@@ -13,6 +13,8 @@ Extra Credits:
 
 """
 
+import random
+
 import pytest
 import torch
 
@@ -72,7 +74,7 @@ def _varlen_fwd(Q, K, V, O, LSE, CU_Q, CU_K, ALIBI_SLOPES,
         if USE_ALIBI:
             scores -= slope * tl.abs(q_pos[:, None] - key_pos)
         if SOFTCAP > 0:
-            scores = SOFTCAP * tl.math.tanh(scores / SOFTCAP)
+            scores = SOFTCAP * (2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0)
         scores = scores * 1.4426950408889634
         scores = tl.where(valid & q_valid[:, None], scores, -float('inf'))
         m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -149,11 +151,11 @@ def _varlen_bwd(Q, K, V, O, DO, DQ, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
         if USE_ALIBI:
             scores -= slope * tl.abs(q_pos[:, None] - key_pos)
         if SOFTCAP > 0:
-            cap_tanh = tl.math.tanh(scores / SOFTCAP)
+            cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0
             scores = SOFTCAP * cap_tanh
             cap_grad = 1.0 - cap_tanh * cap_tanh
         else:
-            cap_grad = 1.0
+            cap_grad = tl.zeros_like(scores) + 1.0
         p = tl.math.exp2(scores * 1.4426950408889634 - lse[:, None])
         p = tl.where(lse[:, None] == -float('inf'), 0.0, p)
         p = tl.where(valid & q_valid[:, None], p, 0.0)
@@ -209,7 +211,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                 (offs_m + SEQ_LEN_K - SEQ_LEN_Q)[:, None] - key_positions
             )
         if softcap > 0:
-            qk = softcap * tl.math.tanh(qk / softcap)
+            qk = softcap * (2.0 / (1.0 + tl.math.exp(-2.0 * (qk / softcap))) - 1.0)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
         window_mask = tl.full([BLOCK_M, BLOCK_N], True, tl.int1)
         if window_left >= 0:
@@ -295,14 +297,14 @@ def keep(conf):
 
 
 def prune_configs_by_head_dim(configs, named_args, **kwargs):
-    head_dim = named_args["HEAD_DIM"]
+    head_dim = kwargs["HEAD_DIM"]
     return [config for config in configs if config.kwargs["BLOCK_N"] <= head_dim]
 
 
 @triton.autotune(
     list(filter(keep, configs)),
     key=["N_CTX", "HEAD_DIM", "STAGE", "USE_DROPOUT"],
-    prune_configs_by=prune_configs_by_head_dim,
+    prune_configs_by={"early_config_prune": prune_configs_by_head_dim},
 )
 @triton.jit
 def _attn_fwd(Q, K, V, sm_scale, dropout_p, dropout_seed, M, Out,  #
@@ -476,11 +478,11 @@ def _attn_bwd_dkdv(dk, dv,  #
                 (offs_m + SEQ_LEN_K - SEQ_LEN_Q)[None, :] - offs_n[:, None]
             )
         if softcap > 0:
-            cap_tanh = tl.math.tanh(qkT / softcap)
+            cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (qkT / softcap))) - 1.0
             qkT = softcap * cap_tanh
             cap_grad = 1.0 - cap_tanh * cap_tanh
         else:
-            cap_grad = 1.0
+            cap_grad = tl.zeros_like(qkT) + 1.0
         pT = tl.math.exp2(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
@@ -571,11 +573,11 @@ def _attn_bwd_dq(dq, q, K, V,  #
                 - curr_n - tl.arange(0, BLOCK_N2)[None, :]
             )
         if softcap > 0:
-            cap_tanh = tl.math.tanh(qk / softcap)
+            cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (qk / softcap))) - 1.0
             qk = softcap * cap_tanh
             cap_grad = 1.0 - cap_tanh * cap_tanh
         else:
-            cap_grad = 1.0
+            cap_grad = tl.zeros_like(qk) + 1.0
         p = tl.math.exp2(qk - m)
         # Autoregressive masking.
         if MASK:
@@ -859,7 +861,7 @@ def _attn_bwd(Q, K, V, sm_scale,
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right):
+    def forward(ctx, q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right, use_alibi):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -890,7 +892,7 @@ class _attention(torch.autograd.Function):
             SEQ_LEN_Q=seq_len_q,
             SOFTCAP=softcap * 1.4426950408889634,
             ALIBI_SLOPES=alibi_slopes,
-            USE_ALIBI=bool(torch.any(alibi_slopes != 0)),
+            USE_ALIBI=use_alibi,
             WINDOW_LEFT=window_left,
             WINDOW_RIGHT=window_right,
             **extra_kern_args)
@@ -907,7 +909,7 @@ class _attention(torch.autograd.Function):
         ctx.kv_heads = kv_heads
         ctx.softcap = softcap
         ctx.alibi_slopes = alibi_slopes
-        ctx.use_alibi = bool(torch.any(alibi_slopes != 0))
+        ctx.use_alibi = use_alibi
         ctx.window_left = window_left
         ctx.window_right = window_right
         return o
@@ -961,12 +963,12 @@ class _attention(torch.autograd.Function):
             NATIVE_GQA=ctx.kv_heads != N_HEAD
         )
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def attention(q, k, v, causal=False, sm_scale=None, dropout_p=0.0, dropout_seed=None,
               seq_len_k=None, seq_len_q=None, kv_heads=None, softcap=0.0, alibi_slopes=None,
-              window_left=-1, window_right=-1):
+              window_left=-1, window_right=-1, use_alibi=None):
     """
     Flash attention implementation with dropout using Triton.
     
@@ -997,17 +999,19 @@ def attention(q, k, v, causal=False, sm_scale=None, dropout_p=0.0, dropout_seed=
         raise ValueError("The number of query heads must be divisible by KV heads")
     if alibi_slopes is None:
         alibi_slopes = q.new_zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
-    
+    if use_alibi is None:
+        use_alibi = bool(torch.any(alibi_slopes != 0))
+
     if dropout_seed is None:
-        dropout_seed = torch.randint(0, 2**31 - 1, (), device=q.device).item()
-    
+        dropout_seed = random.randrange(2**31 - 1)
+
     if seq_len_k is None:
         seq_len_k = q.shape[2]
     if seq_len_q is None:
         seq_len_q = q.shape[2]
-    
+
     # Call the autograd function
-    return _attention.apply(q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right)
+    return _attention.apply(q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right, use_alibi)
 
 
 def _varlen_launch_options(head_dim, device):
@@ -1023,7 +1027,7 @@ class _attention_varlen(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
                 max_seqlen_k, causal, sm_scale, dropout_p, dropout_seed,
-                softcap, alibi_slopes, window_left, window_right):
+                softcap, alibi_slopes, window_left, window_right, use_alibi):
         head_dim = q.shape[-1]
         q_heads = q.shape[1]
         kv_heads = k.shape[1]
@@ -1032,7 +1036,6 @@ class _attention_varlen(torch.autograd.Function):
         out = torch.empty_like(q)
         lse = torch.empty((q.shape[0], q_heads), device=q.device, dtype=torch.float32)
         use_dropout = dropout_p > 0.0
-        use_alibi = bool(torch.any(alibi_slopes != 0))
         batch = cu_seqlens_q.numel() - 1
         grid = (triton.cdiv(max_seqlen_q, block_m), batch, q_heads)
         num_warps, num_stages = _varlen_launch_options(head_dim, q.device)
@@ -1085,23 +1088,26 @@ class _attention_varlen(torch.autograd.Function):
             WINDOW_RIGHT=ctx.window_right, SOFTCAP=ctx.softcap,
             num_warps=num_warps, num_stages=num_stages,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
                      max_seqlen_k, causal=False, sm_scale=None, dropout_p=0.0,
                      dropout_seed=None, softcap=0.0, alibi_slopes=None,
-                     window_left=-1, window_right=-1):
+                     window_left=-1, window_right=-1, use_alibi=None):
     """Fused packed variable-length attention using one grid for all sequences."""
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
     if dropout_seed is None:
-        dropout_seed = torch.randint(0, 2**31 - 1, (), device=q.device).item()
+        dropout_seed = random.randrange(2**31 - 1)
+    if alibi_slopes is None:
+        alibi_slopes = q.new_zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
+    if use_alibi is None:
+        use_alibi = bool(torch.any(alibi_slopes != 0))
     return _attention_varlen.apply(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         causal, sm_scale, dropout_p, dropout_seed, softcap, alibi_slopes,
-        window_left, window_right,
-    )
+        window_left, window_right, use_alibi)
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])

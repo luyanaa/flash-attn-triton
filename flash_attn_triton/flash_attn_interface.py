@@ -139,6 +139,7 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         elif alibi_slopes.shape != (batch_size, n_heads_q):
             raise ValueError("alibi_slopes must have shape (nheads,) or (batch, nheads)")
         alibi_slopes = alibi_slopes.contiguous()
+    use_alibi = alibi_slopes is not None and bool(torch.any(alibi_slopes != 0))
 
     if return_attn_probs:
         return _attention_with_probs(
@@ -214,10 +215,11 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
         seq_len_k=original_seq_len_k,
         seq_len_q=original_seq_len_q,
         kv_heads=n_heads_k if native_gqa else n_heads_q,
-        softcap=softcap,
+                softcap=softcap,
         alibi_slopes=alibi_slopes,
         window_left=window_size[0],
         window_right=window_size[1],
+        use_alibi=use_alibi,
     )
     
     # Transpose the output back to the expected shape [batch, seq_len, heads, head_dim]
@@ -271,6 +273,7 @@ def flash_attn_func_cross(q, k, v, dropout_p=0.0, softmax_scale=None, causal=Fal
         elif alibi_slopes.shape != (q.shape[0], q_heads):
             raise ValueError("alibi_slopes must have shape (nheads,) or (batch, nheads)")
         alibi_slopes = alibi_slopes.contiguous()
+    use_alibi = alibi_slopes is not None and bool(torch.any(alibi_slopes != 0))
 
     if return_attn_probs:
         return _attention_with_probs(
@@ -304,12 +307,14 @@ def flash_attn_func_cross(q, k, v, dropout_p=0.0, softmax_scale=None, causal=Fal
         causal,
         softmax_scale,
         dropout_p,
+        seq_len_k=original_k_len,
         seq_len_q=original_k_len - _causal_offset,
         kv_heads=k.shape[2],
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         window_left=window_size[0],
         window_right=window_size[1],
+        use_alibi=use_alibi,
     )
     return out.transpose(1, 2).contiguous()[:, :original_q_len]
     
@@ -606,6 +611,7 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
         raise ValueError("max sequence lengths must cover every packed sequence")
     if max_seqlen_q == 0 or max_seqlen_k == 0:
         return q.new_zeros((q.shape[0], q.shape[1], q.shape[2]))
+    provided_alibi = alibi_slopes is not None
     if alibi_slopes is None:
         alibi_slopes = q.new_zeros((cu_seqlens_q.numel() - 1, q.shape[1]), dtype=torch.float32)
     else:
@@ -617,9 +623,9 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
         elif alibi_slopes.shape != (cu_seqlens_q.numel() - 1, q.shape[1]):
             raise ValueError("alibi_slopes must have shape (nheads,) or (batch, nheads)")
         alibi_slopes = alibi_slopes.contiguous()
+    use_alibi = provided_alibi and bool(torch.any(alibi_slopes != 0))
     if return_attn_probs:
         outputs = []
-        batch_size = cu_seqlens_q.numel() - 1
         lses = q.new_full((batch_size, q.shape[1], max_seqlen_q), float("-inf"), dtype=torch.float32)
         probabilities = q.new_zeros((batch_size, q.shape[1], max_seqlen_q, max_seqlen_k), dtype=torch.float32)
         for batch_idx in range(batch_size):
@@ -658,6 +664,15 @@ def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
                 window_size=window_size, deterministic=True,
             ).squeeze(0))
         return torch.cat(outputs, dim=0)
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    return attention_varlen(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        causal=causal, sm_scale=softmax_scale, dropout_p=dropout_p,
+        softcap=softcap, alibi_slopes=alibi_slopes,
+        window_left=window_size[0], window_right=window_size[1], use_alibi=use_alibi,
+    )
 
 def flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
                                     max_seqlen_k, dropout_p=0.0, softmax_scale=None,
