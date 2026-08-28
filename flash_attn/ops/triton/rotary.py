@@ -178,11 +178,18 @@ def apply_rotary(
 
     cos, sin = cos.contiguous(), sin.contiguous()
     if isinstance(seqlen_offsets, torch.Tensor):
-        assert seqlen_offsets.shape == (batch,)
-        assert seqlen_offsets.dtype in [torch.int32, torch.int64]
+        if seqlen_offsets.shape != (batch,):
+            raise ValueError("seqlen_offsets must have one value per batch item")
+        if seqlen_offsets.dtype not in [torch.int32, torch.int64]:
+            raise ValueError("seqlen_offsets must use int32 or int64")
+        if seqlen_offsets.device != x.device:
+            raise ValueError("seqlen_offsets must be on the same device as x")
+        if torch.any(seqlen_offsets < 0) or torch.any(seqlen_offsets + seqlen > seqlen_ro):
+            raise ValueError("seqlen_offsets must keep every rotary position within the table")
         seqlen_offsets = seqlen_offsets.contiguous()
     else:
-        assert seqlen_offsets + seqlen <= seqlen_ro
+        if seqlen_offsets < 0 or seqlen_offsets + seqlen > seqlen_ro:
+            raise ValueError("seqlen_offsets must keep every rotary position within the table")
 
     output = torch.empty_like(x) if not inplace else x
     if rotary_dim < headdim and not inplace:

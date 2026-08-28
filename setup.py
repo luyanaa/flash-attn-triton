@@ -19,7 +19,7 @@ setuptools.setup(
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX :: Linux",
     ],
     # https://research.google.com/colaboratory/runtime-version-faq.html
     # Using Colab's Runtime 2025.7 version.

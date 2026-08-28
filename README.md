@@ -1,6 +1,6 @@
 # Flash Attention Triton
 
-This repository provides a wrapper for the Triton implementation of the Flash Attention algorithm with a Flash Attention 2 compatible API. It allows for a drop-in replacement of the original Flash Attention 2 package for supported functionality. This package provides support for Volta (eg. V100, Titan V) and Turing (eg. 2080 Ti, T4) GPUs not supported by the original FA2 CUDA package.
+This repository provides a Triton implementation of Flash Attention with a Flash Attention 2-compatible API. Supported attention paths follow PyTorch `scaled_dot_product_attention` semantics, including upper-left causal alignment for rectangular inputs. It targets Volta (eg. V100, Titan V) and Turing (eg. 2080 Ti, T4) GPUs not supported by the original FA2 CUDA package.
 
 ## Requirements
 - PyTorch 2.6, Triton 3.2 (last Turing-compatible Triton.)
@@ -27,18 +27,19 @@ out = flash_attn(q, k, v, causal=True)
 
 ## Currently Supported Features
 
-- Basic attention mechanism (forward and backward)
-- FP16 (accumulated into FP32) on Turing and Volta GPUs.
+- Basic equal-length self-attention (forward and backward)
+- Dedicated unequal-length cross-attention via `flash_attn_func_cross`
+- Packed variable-length attention via `flash_attn_varlen_func` and packed variants
+- FP16 and FP32 inputs with FP32 accumulation on Turing and Volta GPUs.
+- Softcap score transformation in forward and backward.
+- ALiBi slopes with `(nheads,)` or `(batch, nheads)` inputs.
+- Optional native GQA/MQA addressing for inference and training (`use_native_gqa=True`)
+- KV-cache attention and cache appends via `flash_attn_with_kvcache`, including rotary, remapped, and paged caches
+- Sliding-window attention through the Triton forward and backward kernels
 - Causal and non-causal masking
 - Softmax scaling
-- Basic MQA/GQA support (via tensor repetition)
+- MQA/GQA support via native grouped-head addressing or K/V repetition
 - Head dims 16, 32, 64, 128, 256
-
-## Limitations
-
-This implementation does not currently support:
-- varlen/unpadded support
-- Attention bias, ALiBi, Sliding window attention
 
 ## Benchmarks
 ### RTX 2080 Ti (Turing)
