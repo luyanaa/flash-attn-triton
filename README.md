@@ -48,11 +48,12 @@ out = flash_attn(q, k, v, causal=True)
 `csrc/fmha_cuda.cu` is a hand-written CUDA implementation of FlashAttention-2
 for the pre-Ampere tensor-core generations, mirroring the approach of the
 community V100 implementations (ai-bond, ZRayZzz, zhinianqin
-`flash-attention-v100` repos). It uses `nvcuda::wmma` m16n16k16 fragments,
-which compile for both Volta and Turing, with the dQ/dKV backward split and
-the causal mask applied in the per-row softmax. Volta has no INT8 tensor
-cores, so this backend is FP16-only; the INT8 path remains the Triton
-experimental path for Turing (sm_75) in `flash_attn_func_int8`.
+`flash-attention-v100` repos). The forward uses Turing's native
+`mma.sync.aligned.m16n8k8` PTX on sm_75 (fragment layout per the PTX ISA
+tables), the Volta path uses `nvcuda::wmma` m16n16k16, and the backward uses
+the dQ/dKV split with the causal mask in the per-row softmax. Volta has no
+INT8 tensor cores, so this backend is FP16-only; the INT8 path remains the
+Triton experimental path for Turing (sm_75) in `flash_attn_func_int8`.
 
 Build (requires nvcc + CUDA Toolkit 12.8, torch 2.6):
 
@@ -69,10 +70,13 @@ out = flash_attn_cuda_func(q, k, v, causal=True)   # fp16, head_dim 64
 
 `flash_attn_cuda_func` validates inputs (fp16, head_dim 64, equal lengths),
 dispatches to the CUDA kernel on sm_70/sm_75 when the extension is built, and
-falls back to the Triton `flash_attn_func` otherwise. Verified on T4: forward
-rel err 1e-4 and backward dQ/dK/dV rel err ~5e-4 vs PyTorch SDPA (fp16
-precision). Performance work is ongoing — see the `build_cuda_colab.sh`
-script for the one-shot build-and-verify flow on a Colab T4.
+falls back to the Triton `flash_attn_func` otherwise. Verified on a Kaggle T4
+(torch 2.10/cu128): forward rel err 2.1e-4 (noncausal) / 2e-5 (causal),
+backward dQ/dK/dV rel err 7.7e-4 / 6.5e-4 / 4.4e-4 vs PyTorch SDPA (fp16
+precision). Speed: the native m16n8k8 forward is ~1.6x faster than the Triton
+path at S=2048 (33.5 vs 54.2 ms) but loses at small S (BLOCK_M=32 ->
+low occupancy for short sequences). See `build_cuda_colab.sh` for the
+one-shot build-and-verify flow on a Colab/Kaggle T4.
 
 ## Benchmarks
 ### RTX 2080 Ti (Turing)

@@ -199,6 +199,219 @@ __global__ void __launch_bounds__(128) fmha_fwd_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// FORWARD (native Turing m16n8k8 MMA)  BLOCK_M=32, BLOCK_N=64, HEAD_DIM=64
+// Turing's native fp16 MMA is mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+// (sm_75; m16n8k16 requires sm_80+). The wmma m16n16k16 path expands to 2x the
+// MMA work with layout-conversion overhead in load/store_matrix_sync; this
+// kernel issues the native instruction directly (ai-bond style). smem ~40KB,
+// under the 48KB opt-in threshold.
+// On sm_70 the asm is guarded out (host dispatches the wmma kernel there).
+// ---------------------------------------------------------------------------
+#if __CUDA_ARCH__ >= 750
+__device__ __forceinline__ void mma_f16_m16n8k8(
+    float &c0, float &c1, float &c2, float &c3,
+    uint32_t a0, uint32_t a1, uint32_t b0) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+      : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+      : "r"(a0), "r"(a1), "r"(b0));
+}
+#endif
+
+template <int BLOCK_M, int BLOCK_N, int HEAD_DIM>
+__global__ void __launch_bounds__(128) fmha_fwd_native_kernel(
+    const __half *__restrict__ Q, const __half *__restrict__ K,
+    const __half *__restrict__ V, __half *__restrict__ O,
+    float *__restrict__ LSE,
+    const int M, const int N, const int seqlen_k,
+    const float sm_scale, const bool causal) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int g = lane >> 2;          // groupID 0..7
+  const int t = lane & 3;           // thread-in-group 0..3
+  const int off_m = blockIdx.x * BLOCK_M;
+  const long bh = blockIdx.y;
+  const long qkv_off = bh * (long)M * HEAD_DIM;
+  const __half *q_ptr = Q + qkv_off + (long)off_m * HEAD_DIM;
+  const __half *k_base = K + qkv_off;
+  const __half *v_base = V + qkv_off;
+
+  extern __shared__ __half sdata[];
+  __half *sQ = sdata;
+  __half *sK = sQ + BLOCK_M * HEAD_DIM;
+  __half *sV = sK + BLOCK_N * HEAD_DIM;
+  float *sS = (float *)(sV + BLOCK_N * HEAD_DIM);   // [BM, BN] fp32; reused as PV staging
+  __half *sP = (__half *)(sS + BLOCK_M * BLOCK_N);  // [BM, BN] fp16
+  float *sO = (float *)(sP + BLOCK_M * BLOCK_N);    // [BM, HEAD_DIM] fp32
+  __shared__ float sMax[BLOCK_M];
+  __shared__ float sSum[BLOCK_M];
+  __shared__ float sAlpha[BLOCK_M];
+
+  {
+    const int total = BLOCK_M * HEAD_DIM / 2;
+    for (int i = tid; i < total; i += blockDim.x) {
+      const int r = (i * 2) / HEAD_DIM;
+      const int c = (i * 2) % HEAD_DIM;
+      *reinterpret_cast<__half2 *>(&sQ[r * HEAD_DIM + c]) =
+          *reinterpret_cast<const __half2 *>(q_ptr + r * HEAD_DIM + c);
+    }
+  }
+  if (tid < BLOCK_M) {
+    sMax[tid] = -CUDART_INF_F;
+    sSum[tid] = 0.f;
+  }
+  for (int i = tid; i < BLOCK_M * HEAD_DIM; i += blockDim.x) sO[i] = 0.f;
+
+  for (int n0 = 0; n0 < N; n0 += BLOCK_N) {
+    const __half *k_ptr = k_base + (long)n0 * HEAD_DIM;
+    const __half *v_ptr = v_base + (long)n0 * HEAD_DIM;
+    for (int i = tid; i < BLOCK_N * HEAD_DIM / 2; i += blockDim.x) {
+      const int r = (i * 2) / HEAD_DIM;
+      const int c = (i * 2) % HEAD_DIM;
+      *reinterpret_cast<__half2 *>(&sK[r * HEAD_DIM + c]) =
+          *reinterpret_cast<const __half2 *>(k_ptr + r * HEAD_DIM + c);
+      *reinterpret_cast<__half2 *>(&sV[r * HEAD_DIM + c]) =
+          *reinterpret_cast<const __half2 *>(v_ptr + r * HEAD_DIM + c);
+    }
+    __syncthreads();
+
+    // S = Q @ K^T  -> sS (fp32). Tiles: [BM/16] x [BN/8] m16n8k8.
+    #pragma unroll
+    for (int mt = 0; mt < BLOCK_M / 16; ++mt) {
+      #pragma unroll
+      for (int nt = 0; nt < BLOCK_N / 8; ++nt) {
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+        #pragma unroll
+        for (int kt = 0; kt < HEAD_DIM / 8; ++kt) {
+#if __CUDA_ARCH__ >= 750
+          const uint32_t *qa = reinterpret_cast<const uint32_t *>(
+              sQ + (mt * 16 + g) * HEAD_DIM + kt * 8 + 2 * t);
+          uint32_t a0 = *qa;
+          const uint32_t *qa2 = reinterpret_cast<const uint32_t *>(
+              sQ + (mt * 16 + g + 8) * HEAD_DIM + kt * 8 + 2 * t);
+          uint32_t a1 = *qa2;
+          const uint32_t *kb = reinterpret_cast<const uint32_t *>(
+              sK + (nt * 8 + g) * HEAD_DIM + kt * 8 + 2 * t);
+          uint32_t b0 = *kb;
+          mma_f16_m16n8k8(c0, c1, c2, c3, a0, a1, b0);
+#endif
+        }
+        sS[(mt * 16 + g) * BLOCK_N + nt * 8 + 2 * t] = c0;
+        sS[(mt * 16 + g) * BLOCK_N + nt * 8 + 2 * t + 1] = c1;
+        sS[(mt * 16 + g + 8) * BLOCK_N + nt * 8 + 2 * t] = c2;
+        sS[(mt * 16 + g + 8) * BLOCK_N + nt * 8 + 2 * t + 1] = c3;
+      }
+    }
+    __syncthreads();
+
+    // Online softmax. Four threads per row (4*BLOCK_M == blockDim), each over
+    // BLOCK_N/4 columns; max and sum reduced via two warp shuffles.
+    {
+      const int rows_per_q = BLOCK_N / 4;
+      if (tid < 4 * BLOCK_M) {
+        const int row = tid / 4;
+        const int q = tid % 4;
+        const int qpos = off_m + row;
+        float rowmax = -CUDART_INF_F;
+        for (int j = q * rows_per_q; j < (q + 1) * rows_per_q; ++j) {
+          float v = sS[row * BLOCK_N + j] * sm_scale;
+          const int kpos = n0 + j;
+          const bool valid = (qpos < M) && (kpos < seqlen_k) && (!causal || qpos >= kpos);
+          if (!valid) v = -CUDART_INF_F;
+          rowmax = fmaxf(rowmax, v);
+        }
+        // reduce max across the 4 threads of the row (lanes 4r..4r+3)
+        rowmax = fmaxf(rowmax, __shfl_xor_sync(0xffffffff, rowmax, 1));
+        rowmax = fmaxf(rowmax, __shfl_xor_sync(0xffffffff, rowmax, 2));
+        __syncthreads();
+        const float old_max = sMax[row];
+        const float new_max = fmaxf(old_max, rowmax);
+        const float alpha = __expf(old_max - new_max);
+        float sum = 0.f;
+        __half *sProw = &sP[row * BLOCK_N];
+        for (int j = q * rows_per_q; j < (q + 1) * rows_per_q; ++j) {
+          float v = sS[row * BLOCK_N + j] * sm_scale;
+          const int kpos = n0 + j;
+          const bool valid = (qpos < M) && (kpos < seqlen_k) && (!causal || qpos >= kpos);
+          if (!valid) v = -CUDART_INF_F;
+          const float p = __expf(v - new_max);
+          sum += p;
+          sProw[j] = __float2half(p);
+        }
+        sum += __shfl_xor_sync(0xffffffff, sum, 1);
+        sum += __shfl_xor_sync(0xffffffff, sum, 2);
+        if (q == 0) {
+          sSum[row] = sSum[row] * alpha + sum;
+          sMax[row] = new_max;
+          sAlpha[row] = alpha;
+        }
+      }
+      __syncthreads();
+    }
+
+    // PV = P @ V  -> sS (reuse, P consumed) as fp32 [BM, HEAD_DIM].
+    // Tiles: [BM/16] x [HEAD_DIM/8] m16n8k8; K-dim = BLOCK_N in 8-steps.
+    #pragma unroll
+    for (int mt = 0; mt < BLOCK_M / 16; ++mt) {
+      #pragma unroll
+      for (int dt = 0; dt < HEAD_DIM / 8; ++dt) {
+        float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+        #pragma unroll
+        for (int kt = 0; kt < BLOCK_N / 8; ++kt) {
+#if __CUDA_ARCH__ >= 750
+          const uint32_t *pa = reinterpret_cast<const uint32_t *>(
+              sP + (mt * 16 + g) * BLOCK_N + kt * 8 + 2 * t);
+          uint32_t a0 = *pa;
+          const uint32_t *pa2 = reinterpret_cast<const uint32_t *>(
+              sP + (mt * 16 + g + 8) * BLOCK_N + kt * 8 + 2 * t);
+          uint32_t a1 = *pa2;
+          const int n = dt * 8 + g;
+          // B (col-major fragment): b0 = {(2t, g), (2t+1, g)} where B[k][n] =
+          // V[k][n]; V is row-major [BLOCK_N][HEAD_DIM] so V[2t][g] and
+          // V[2t+1][g] are strided by HEAD_DIM (not adjacent).
+          uint32_t b0 = (uint32_t)(__half_as_ushort(
+              sV[(kt * 8 + 2 * t + 1) * HEAD_DIM + n])) << 16 |
+                        (uint32_t)(__half_as_ushort(
+              sV[(kt * 8 + 2 * t) * HEAD_DIM + n]));
+          mma_f16_m16n8k8(c0, c1, c2, c3, a0, a1, b0);
+#endif
+        }
+        sS[(mt * 16 + g) * HEAD_DIM + dt * 8 + 2 * t] = c0;
+        sS[(mt * 16 + g) * HEAD_DIM + dt * 8 + 2 * t + 1] = c1;
+        sS[(mt * 16 + g + 8) * HEAD_DIM + dt * 8 + 2 * t] = c2;
+        sS[(mt * 16 + g + 8) * HEAD_DIM + dt * 8 + 2 * t + 1] = c3;
+      }
+    }
+    __syncthreads();
+
+    // sO = sO * alpha + PV  (parallel across all threads)
+    for (int i = tid; i < BLOCK_M * HEAD_DIM; i += blockDim.x) {
+      const int r = i / HEAD_DIM;
+      sO[i] = sO[i] * sAlpha[r] + sS[i];
+    }
+    __syncthreads();
+  }
+
+  // Store O / sum and LSE = max + log(sum).
+  if (tid < BLOCK_M) {
+    const int row = tid;
+    const int qpos = off_m + row;
+    const float l = sSum[row];
+    const float m = sMax[row];
+    if (qpos < M) {
+      LSE[bh * (long)M + qpos] = m + logf(l);
+      const float inv = 1.0f / l;
+      __half *o_ptr = O + bh * (long)M * HEAD_DIM + (long)qpos * HEAD_DIM;
+      const float *orow = &sO[row * HEAD_DIM];
+      for (int d = 0; d < HEAD_DIM; d += 2)
+        *reinterpret_cast<__half2 *>(o_ptr + d) =
+            __floats2half2_rn(orow[d] * inv, orow[d + 1] * inv);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // BACKWARD dKV: per (b, h, key-block). dK and dV accumulate in wmma fragments.
 // smem: sK,sV [BN,D], sQ,sDO [BM,D] (fp16), sST [BN,BM] fp32 (S^T),
 //       sPT [BN,BM] fp16 (P^T then dS^T), sDPT [BN,BM] fp32 (dP^T).
@@ -573,6 +786,42 @@ std::vector<torch::Tensor> fmha_forward(torch::Tensor q, torch::Tensor k, torch:
   const int B = q.size(0), H = q.size(1), M = q.size(2), D = q.size(3);
   TORCH_CHECK(D == 64, "fmha_cuda supports head_dim 64");
   auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int dev = 0;
+  cudaGetDevice(&dev);
+  int cc_major = 0, cc_minor = 0;
+  cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev);
+  if (cc_major == 7 && cc_minor >= 5) {
+    // Native m16n8k8 MMA forward (Turing): BLOCK_M=32, BLOCK_N=64.
+    constexpr int NBM = 32;
+    constexpr int NBN = 64;
+    const int pad_n = (NBM - M % NBM) % NBM;
+    const int Mp_n = M + pad_n;
+    auto qpn = torch::zeros({B, H, Mp_n, D}, q.options());
+    auto kpn = torch::zeros({B, H, Mp_n, D}, q.options());
+    auto vpn = torch::zeros({B, H, Mp_n, D}, q.options());
+    qpn.narrow(2, 0, M).copy_(qc);
+    kpn.narrow(2, 0, M).copy_(kc);
+    vpn.narrow(2, 0, M).copy_(vc);
+    auto outn = torch::empty({B, H, Mp_n, D}, q.options());
+    auto lsen = torch::empty({B, H, Mp_n}, q.options().dtype(at::kFloat));
+    // smem: sQ + sK + sV + sP (fp16), sS + sO (fp32)
+    size_t shmem_n = (NBM * D + 2 * NBN * D + NBM * NBN) * sizeof(__half) +
+                     (NBM * NBN + NBM * D) * sizeof(float);
+    dim3 grid_n((Mp_n + NBM - 1) / NBM, B * H);
+    fmha_fwd_native_kernel<NBM, NBN, 64><<<grid_n, 128, shmem_n, stream>>>(
+        reinterpret_cast<const __half *>(qpn.data_ptr()),
+        reinterpret_cast<const __half *>(kpn.data_ptr()),
+        reinterpret_cast<const __half *>(vpn.data_ptr()),
+        reinterpret_cast<__half *>(outn.data_ptr()),
+        reinterpret_cast<float *>(lsen.data_ptr()),
+        Mp_n, Mp_n, M, (float)sm_scale, causal);
+    C10_CUDA_CHECK(cudaGetLastError());
+    return {outn.narrow(2, 0, M).contiguous(), lsen.narrow(2, 0, M)};
+  }
+  // wmma m16n16k16 forward (Volta sm_70).
   const int pad = (kBlockM - M % kBlockM) % kBlockM;
   const int Mp = M + pad;
   auto qp = torch::zeros({B, H, Mp, D}, q.options());
@@ -583,11 +832,9 @@ std::vector<torch::Tensor> fmha_forward(torch::Tensor q, torch::Tensor k, torch:
   vp.narrow(2, 0, M).copy_(vc);
   auto out = torch::empty({B, H, Mp, D}, q.options());
   auto lse = torch::empty({B, H, Mp}, q.options().dtype(at::kFloat));
-
   // smem: sQ + sK + sV + sP (fp16), sS + sPV + sO (fp32)
   size_t shmem = (kBlockM * D + 2 * kBlockN * D + kBlockM * kBlockN) * sizeof(__half) +
                  (kBlockM * kBlockN + kBlockM * D + kBlockM * D) * sizeof(float);
-  // Dynamic + static (sMax/sSum/sAlpha) must fit 64KB; use a safe budget.
   const int static_bytes = 3 * kBlockM * sizeof(float);
   cudaError_t attr_err = cudaFuncSetAttribute(
       fmha_fwd_kernel<kBlockM, kBlockN, 64>,
@@ -595,7 +842,6 @@ std::vector<torch::Tensor> fmha_forward(torch::Tensor q, torch::Tensor k, torch:
   TORCH_CHECK(attr_err == cudaSuccess,
               "cudaFuncSetAttribute failed: ", cudaGetErrorString(attr_err));
   dim3 grid((Mp + kBlockM - 1) / kBlockM, B * H);
-  auto stream = at::cuda::getCurrentCUDAStream();
   fmha_fwd_kernel<kBlockM, kBlockN, 64><<<grid, 128, shmem, stream>>>(
       reinterpret_cast<const __half *>(qp.data_ptr()),
       reinterpret_cast<const __half *>(kp.data_ptr()),
