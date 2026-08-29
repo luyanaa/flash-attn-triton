@@ -6,8 +6,8 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
-# Import the attention function from the Triton kernel implementation
 from .triton_kernel.attention_kernel import attention, attention_varlen
+from .triton_kernel.attention_kernel_int8 import attention_int8
 
 BLOCK_SIZE = 128
 
@@ -317,7 +317,116 @@ def flash_attn_func_cross(q, k, v, dropout_p=0.0, softmax_scale=None, causal=Fal
         use_alibi=use_alibi,
     )
     return out.transpose(1, 2).contiguous()[:, :original_q_len]
-    
+
+
+def flash_attn_func_int8(q, k, v, softmax_scale=None, causal=False):
+    """SageBwd-style INT8 Flash Attention (Turing sm_75 only) - EXPERIMENTAL.
+
+    Uses INT8 tensor cores for the forward QK^T matmul, keeping the PV and
+    the backward dP in FP16 (per SageBwd, arXiv 2505.11594 / 2603.02170).
+    Volta (sm_70) has no INT8 tensor cores and falls back to the fp16 path.
+
+    Current state (verified on T4, torch 2.6.0 + triton 3.2.0):
+      - Forward accuracy: rel err 0.5-2% vs the fp16 path (causal and noncausal),
+        which is typical for naive INT8 attention.
+      - Backward: functional, ~1-2x gradient error at short sequences (S<=64);
+        error grows with sequence length because the FP16 S-recompute is
+        normalized by the INT8 forward's LSE.
+      - Speed: ~0.66x the fp16 path. Triton 3.2's INT8 MMA at the kernel's
+        64x64x64 block shapes gives only ~6% raw dot speedup on T4, which the
+        per-tile quantize/dequantize overhead more than cancels.
+
+    Known Triton 3.2 sm_75 constraints baked into this kernel:
+      - tl.dot with int8 operands only works for operands loaded from memory;
+        in-kernel quantized operands corrupt the MMA layout (garbage results).
+        Hence PV and the backward S-recompute run in FP16.
+      - tl.trans on a computed operand breaks the MMA layout; transposes are
+        only applied to loaded tensors.
+
+    Prefer `flash_attn_func` for production use; this path is for developing
+    the SageBwd INT8 treatment.
+
+    Args:
+        q, k, v: (batch_size, seqlen, nheads, headdim), equal length, fp16.
+        softmax_scale: float or None (defaults to 1/sqrt(headdim)).
+        causal: bool.
+    """
+    if q.dtype not in (torch.float16, torch.float32) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("flash_attn_func_int8 supports matching FP16 or FP32 tensors")
+    if q.shape[1] != k.shape[1] or k.shape[1] != v.shape[1]:
+        raise ValueError("flash_attn_func_int8 requires equal query and KV sequence lengths")
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("All attention tensors must be CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(q.device)
+    if (major, minor) != (7, 5):
+        # No INT8 tensor cores on this device; fall back to the fp16 path.
+        return flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    batch, seqlen, nheads, head_dim = q.shape
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    # Pad the sequence to the kernel block size (64) to avoid out-of-bounds
+    # block loads; the kernel masks the padded region via SEQ_LEN_K < N_CTX.
+    block = 64
+    pad = (block - seqlen % block) % block
+    if pad:
+        qp = torch.zeros(batch, pad, nheads, head_dim, device=q.device, dtype=q.dtype)
+        kp = torch.zeros(batch, pad, nheads, head_dim, device=q.device, dtype=k.dtype)
+        vp = torch.zeros(batch, pad, nheads, head_dim, device=q.device, dtype=v.dtype)
+        q = torch.cat([q, qp], dim=1)
+        k = torch.cat([k, kp], dim=1)
+        v = torch.cat([v, vp], dim=1)
+    out = attention_int8(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        causal=causal, sm_scale=softmax_scale,
+        seq_len_k=seqlen, seq_len_q=seqlen,
+    )
+    return out.transpose(1, 2).contiguous()[:, :seqlen]
+
+
+def flash_attn_cuda_func(q, k, v, softmax_scale=None, causal=False):
+    """Pure-CUDA FP16 Flash Attention for Turing (sm_75) and Volta (sm_70).
+
+    Uses the compiled ``fmha_cuda`` extension (csrc/fmha_cuda.cu, built with
+    ``setup_cuda.py``), a hand-written CUDA implementation of FlashAttention-2
+    for the pre-Ampere tensor-core generations via ``nvcuda::wmma`` fragments.
+
+    Requires head_dim == 64, equal q/k/v lengths, fp16 inputs.  Falls back to
+    the Triton ``flash_attn_func`` if the extension is not built or the device
+    lacks support.
+
+    Args:
+        q, k, v: (batch_size, seqlen, nheads, headdim), equal length, fp16.
+        softmax_scale: float or None (defaults to 1/sqrt(headdim)).
+        causal: bool.
+    """
+    if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
+        raise ValueError("flash_attn_cuda_func requires FP16 tensors")
+    if q.shape[1] != k.shape[1] or k.shape[1] != v.shape[1]:
+        raise ValueError("flash_attn_cuda_func requires equal query and KV sequence lengths")
+    if q.shape[-1] != 64:
+        raise ValueError("flash_attn_cuda_func supports head_dim 64")
+    try:
+        from . import fmha_cuda
+    except ImportError:
+        # Extension not built; fall back to the Triton implementation.
+        return flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    if not (q.is_cuda and k.is_cuda and v.is_cuda):
+        raise ValueError("All attention tensors must be CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(q.device)
+    if (major, minor) not in ((7, 0), (7, 5)):
+        # No Volta/Turing tensor cores (e.g. sm_80+); Triton path.
+        return flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    out, lse = fmha_cuda.fmha_forward(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).contiguous(),
+        float(softmax_scale), causal)
+    return out.transpose(1, 2).contiguous()
+
 
 def flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
                               window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False,

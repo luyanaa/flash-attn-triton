@@ -15,4 +15,6 @@ from .flash_attn_interface import (
     flash_attn_varlen_kvpacked_func,
     FlashSelfAttention,
     FlashCrossAttention,
+    flash_attn_func_int8,
+    flash_attn_cuda_func,
 )

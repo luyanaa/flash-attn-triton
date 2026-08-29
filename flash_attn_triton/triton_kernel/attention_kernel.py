@@ -277,16 +277,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_stages=3, num_warps=8),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
 ]
 
 
@@ -365,9 +370,8 @@ def _attn_fwd(Q, K, V, sm_scale, dropout_p, dropout_seed, M, Out,  #
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
-    # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_m = tl.max_contiguous(tl.multiple_of(start_m * BLOCK_M + tl.arange(0, BLOCK_M), BLOCK_M), BLOCK_M)
+    offs_n = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_N), BLOCK_N), BLOCK_N)
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
@@ -451,9 +455,9 @@ def _attn_bwd_dkdv(dk, dv,  #
                     SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
                     WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
                     softcap, alibi_slope):
-    offs_m = start_m + tl.arange(0, BLOCK_M1)
-    offs_n = start_n + tl.arange(0, BLOCK_N1)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_m = tl.max_contiguous(tl.multiple_of(start_m + tl.arange(0, BLOCK_M1), BLOCK_M1), BLOCK_M1)
+    offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N1), BLOCK_N1), BLOCK_N1)
+    offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
     qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
@@ -464,7 +468,7 @@ def _attn_bwd_dkdv(dk, dv,  #
     for blk_idx in range(num_steps):
         qT = tl.load(qT_ptrs)
         # Load m before computing qk to reduce pipeline stall.
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
+        offs_m = tl.max_contiguous(tl.multiple_of(curr_m + tl.arange(0, BLOCK_M1), BLOCK_M1), BLOCK_M1)
         m = tl.load(M + offs_m)
         qkT = tl.dot(k, qT, out_dtype=tl.float32) * (sm_scale * 1.4426950408889634)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
@@ -544,9 +548,9 @@ def _attn_bwd_dq(dq, q, K, V,  #
                  SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
                  WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
                  softcap, alibi_slope):
-    offs_m = start_m + tl.arange(0, BLOCK_M2)
-    offs_n = start_n + tl.arange(0, BLOCK_N2)
-    offs_k = tl.arange(0, HEAD_DIM)
+    offs_m = tl.max_contiguous(tl.multiple_of(start_m + tl.arange(0, BLOCK_M2), BLOCK_M2), BLOCK_M2)
+    offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N2), BLOCK_N2), BLOCK_N2)
+    offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     # D (= delta) is pre-divided by ds_scale.
