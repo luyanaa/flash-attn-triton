@@ -1,160 +1,154 @@
 # Flash Attention Triton
 
-This repository provides a Triton implementation of Flash Attention with a Flash Attention 2-compatible API. Supported attention paths follow PyTorch `scaled_dot_product_attention` semantics, including upper-left causal alignment for rectangular inputs. It targets Volta (eg. V100, Titan V) and Turing (eg. 2080 Ti, T4) GPUs not supported by the original FA2 CUDA package.
+This repository provides a Triton implementation of Flash Attention with a
+Flash Attention 2-compatible API. Supported attention paths follow PyTorch
+`scaled_dot_product_attention` semantics, including upper-left causal
+alignment for rectangular inputs. All attention kernels are implemented in
+Triton; no handwritten CUDA extension is required.
 
 ## Requirements
-- PyTorch 2.6, Triton 3.2 (last Turing-compatible Triton.)
-- CUDA Toolkit 12.8 system-wide (https://github.com/googlecolab/backend-info#202507) 
+
+- PyTorch <=2.6
+- Triton <=3.2 (last Turing-compatible Triton release)
 - CUDA-compatible GPU (compute capability 7.0+)
 
 ## Usage
 
-The API is designed to be a drop-in replacement for Flash Attention 2. You can use it in the same way:
+The API is designed to be a drop-in replacement for Flash Attention 2:
 
 ```python
 from flash_attn import flash_attn_func, flash_attn_qkvpacked_func, FlashAttention
 
-# Basic usage
 out = flash_attn_func(q, k, v, causal=True)
-
-# Packed QKV
 out = flash_attn_qkvpacked_func(qkv, causal=True)
-
-# Module interface
-flash_attn = FlashAttention()
-out = flash_attn(q, k, v, causal=True)
+out = FlashAttention()(q, k, v, causal=True)
 ```
 
-## Currently Supported Features
+## Supported features
 
-- Basic equal-length self-attention (forward and backward)
-- Dedicated unequal-length cross-attention via `flash_attn_func_cross`
-- Packed variable-length attention via `flash_attn_varlen_func` and packed variants
-- FP16 and FP32 inputs with FP32 accumulation on Turing and Volta GPUs.
-- Softcap score transformation in forward and backward.
-- ALiBi slopes with `(nheads,)` or `(batch, nheads)` inputs.
-- Optional native GQA/MQA addressing for inference and training (`use_native_gqa=True`)
-- KV-cache attention and cache appends via `flash_attn_with_kvcache`, including rotary, remapped, and paged caches
-- Sliding-window attention through the Triton forward and backward kernels
+- Equal-length self-attention with forward and backward
+- Unequal-length cross-attention via `flash_attn_func_cross`
+- Packed variable-length attention and packed variants
+- FP16 and FP32 inputs with FP32 accumulation
+- Softcap score transformation
+- ALiBi slopes with `(nheads,)` or `(batch, nheads)` inputs
+- Native inference-only GQA/MQA addressing through `use_native_gqa=True`
+- KV-cache attention and cache appends, including rotary, remapped, and paged caches
+- Sliding-window attention
 - Causal and non-causal masking
-- Softmax scaling
-- MQA/GQA support via native grouped-head addressing or K/V repetition
-- Head dims 16, 32, 64, 128, 256
-- Experimental pure-CUDA FP16 backend for Turing (sm_75) and Volta (sm_70) via
-  `flash_attn_cuda_func` (see below)
+- Configurable softmax scaling
+- Head dimensions 16, 32, 64, 128, and 256
 
-## Pure-CUDA FP16 backend (`flash_attn_cuda_func`)
+## Triton backend notes
 
-`csrc/fmha_cuda.cu` is a hand-written CUDA implementation of FlashAttention-2
-for the pre-Ampere tensor-core generations, mirroring the approach of the
-community V100 implementations (ai-bond, ZRayZzz, zhinianqin
-`flash-attention-v100` repos). The forward uses Turing's native
-`mma.sync.aligned.m16n8k8` PTX on sm_75 (fragment layout per the PTX ISA
-tables), the Volta path uses `nvcuda::wmma` m16n16k16, and the backward uses
-the dQ/dKV split with the causal mask in the per-row softmax. Volta has no
-INT8 tensor cores, so this backend is FP16-only; the INT8 path remains the
-Triton experimental path for Turing (sm_75) in `flash_attn_func_int8`.
+The dense equal-length FP16 path is the primary execution path. The code
+validates dtype, device, shape, head layout, and attention options before
+launching Triton kernels. Unequal query and KV lengths use the dedicated
+cross-attention path with SDPA-compatible upper-left causal alignment.
 
-Build (requires nvcc + CUDA Toolkit 12.8, torch 2.6):
+Dense forward masking applies `-inf` before the row maximum, preserving valid
+rows whose scores are extremely negative. Dense and variable-length epilogues
+use safe normalization and write `-inf` LSE for empty rows. Variable-length
+backward uses matching operand dtypes for Triton matrix products on pre-Ampere
+targets.
 
-```bash
-python setup_cuda.py build_ext --inplace   # produces flash_attn_triton/fmha_cuda.*.so
-```
+The public dense gradient path uses direct dK/dV stores. Packed variable-length
+backward now uses separate dQ and dK/dV grids, so `tl.atomic_add` remains only
+in the low-level native-GQA path, where it preserves grouped-head accumulation
+for callers that bypass the public inference-only restriction.
 
-Use:
+Native GQA remains inference-only when gradients are required. Deterministic
+variable-length fallback, paged-cache reconstruction, materialized attention
+probabilities, and materialized attention bias are correctness/API paths rather
+than throughput paths.
 
-```python
-from flash_attn_triton import flash_attn_cuda_func
-out = flash_attn_cuda_func(q, k, v, causal=True)   # fp16, head_dim 64
-```
+Triton is the sole project-owned attention-kernel backend.
 
-`flash_attn_cuda_func` validates inputs (fp16, head_dim 64, equal lengths),
-dispatches to the CUDA kernel on sm_70/sm_75 when the extension is built, and
-falls back to the Triton `flash_attn_func` otherwise. Verified on a Kaggle T4
-(torch 2.10/cu128): forward rel err 2.1e-4 (noncausal) / 2e-5 (causal),
-backward dQ/dK/dV rel err 7.7e-4 / 6.5e-4 / 4.4e-4 vs PyTorch SDPA (fp16
-precision). Speed: the native m16n8k8 forward is ~1.6x faster than the Triton
-path at S=2048 (33.5 vs 54.2 ms) but loses at small S (BLOCK_M=32 ->
-low occupancy for short sequences). See `build_cuda_colab.sh` for the
-one-shot build-and-verify flow on a Colab/Kaggle T4.
+## Benchmark: Tesla V100
 
-## Benchmarks
-### RTX 2080 Ti (Turing)
+Measured on a Tesla V100-PCIE-32GB with PyTorch `2.5.1+cu124`,
+CUDA `12.4`, Triton `3.1.0`, and xFormers `0.0.29`. Values use the same
+effective-FLOP convention as the T4 benchmark. The xFormers column uses
+the CUTLASS forward/backward operators.
 
-```
-fused-attention-batch4-head32-d64-fwd-causal=True-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      29.258471
-1   2048.0      41.382117
-2   4096.0      46.972266
-3   8192.0      49.315714
-4  16384.0      50.443531
-fused-attention-batch4-head32-d64-fwd-causal=False-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      38.110175
-1   2048.0      47.640577
-2   4096.0      50.301599
-3   8192.0      51.136501
-4  16384.0      51.826783
-fused-attention-batch4-head32-d64-bwd-causal=True-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      22.085938
-1   2048.0      26.173398
-2   4096.0      28.565586
-3   8192.0      30.030201
-4  16384.0      31.082861
-fused-attention-batch4-head32-d64-bwd-causal=False-dropout=0.0:
-     N_CTX  Triton [FP16]
-0   1024.0      27.756566
-1   2048.0      30.274265
-2   4096.0      31.471025
-3   8192.0      32.253811
-4  16384.0      32.614130
-```
+The Volta path now prunes fully masked causal key blocks in packed
+variable-length attention, specializes optional score features at compile
+time, pre-scales Q for dense forward, and excludes 3-stage dense configs.
 
-### NVIDIA T4 (Turing) — vs PyTorch SDPA
+### Forward effective throughput (TFLOP/s)
 
-Measured on a Colab T4 with the pinned torch 2.6.0+cu124 / Triton 3.2.0, FP16, batch 4, 32 heads, head dim 64. Latency is the mean over 30 iterations after warmup; TFLOPS uses the standard fused-attention accounting (4·B·H·S²·D, causal ×0.5, backward ×2.5).
+| B | S | H | D | Causal | Project | xFormers CUTLASS |
+|---:|---:|---:|---:|:---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 20.00 | 16.71 |
+| 4 | 1024 | 32 | 64 | no | 32.06 | 25.08 |
+| 4 | 2048 | 32 | 64 | yes | 33.55 | 24.63 |
+| 8 | 512 | 32 | 64 | no | 27.15 | 21.47 |
+| 2 | 1024 | 64 | 64 | yes | 22.74 | 17.14 |
+| 8 | 512 | 16 | 128 | yes | 16.61 | 16.15 |
+| 1 | 4096 | 16 | 64 | no | 35.45 | 25.32 |
+| 1 | 4096 | 16 | 64 | yes | 29.12 | 21.40 |
 
-**Mid/large sequence lengths** (typical LLM inference/training range) are faster than PyTorch `scaled_dot_product_attention`:
+### Backward effective throughput (TFLOP/s)
 
-| N_CTX | mode | ours (ms) | SDPA (ms) | ours (TFLOP/s) | SDPA (TFLOP/s) | speedup |
-|------:|:----:|----------:|----------:|---------------:|---------------:|--------:|
-|  2048 | cfwd |     5.229 |     5.710 |          13.14 |          12.03 |    1.09 |
-|  2048 | fwd  |     7.773 |    10.543 |          17.68 |          13.04 |    1.36 |
-|  4096 | cfwd |    15.756 |    21.342 |          17.45 |          12.88 |    1.35 |
-|  4096 | fwd  |    26.243 |    40.620 |          20.95 |          13.53 |    1.55 |
-|  2048 | cbwd |    19.441 |    25.973 |           8.84 |           6.61 |    1.34 |
-|  4096 | cbwd |    67.089 |    93.872 |          10.24 |           7.32 |    1.40 |
+| B | S | H | D | Causal | Project | xFormers CUTLASS |
+|---:|---:|---:|---:|:---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 11.77 | 11.13 |
+| 4 | 1024 | 32 | 64 | no | 17.08 | 14.23 |
+| 4 | 2048 | 32 | 64 | yes | 17.76 | 14.09 |
+| 8 | 512 | 32 | 64 | no | 15.08 | 12.67 |
+| 2 | 1024 | 64 | 64 | yes | 14.69 | 11.34 |
+| 8 | 512 | 16 | 128 | yes | 10.99 | 9.49 |
+| 1 | 4096 | 16 | 64 | no | 16.94 | 15.58 |
+| 1 | 4096 | 16 | 64 | yes | 16.77 | 13.47 |
 
-**Short sequence lengths** — per-call GPU→CPU synchronization (ALiBi detection and dropout-seed generation) was removed from the hot path, giving a 1.2–2.5× forward improvement:
+## Benchmark: Tesla T4
 
-| N_CTX | before (ms) | after (ms) | speedup |
-|------:|------------:|-----------:|--------:|
-|   128 |       0.722 |      0.378 |    1.9× |
-|   256 |       0.923 |      0.371 |    2.5× |
-|   512 |       1.029 |      0.597 |    1.7× |
-|  1024 |       2.103 |      1.749 |    1.2× |
+Measured on a Kaggle Tesla T4 (14.56 GiB) with PyTorch `2.6.0+cu124`,
+CUDA `12.4`, and Triton `3.2.0`. Inputs are FP16. Each timing is the
+median of CUDA-event measurements after warmup (20 forward iterations or
+12 backward iterations). The effective FLOP model counts the two attention
+matrix multiplications, uses the logical sequence length, and treats
+backward as 2x forward FLOPs. Softmax, masking, LSE, and other elementwise
+work are excluded.
 
-**Flash Attention v2 tuning (T4, repeated-median over 5 runs)** — memory-coalescing hints (`tl.max_contiguous`/`tl.multiple_of`) in forward and backward, plus Turing/V100-safe autotune configs (`num_stages ≤ 3`; `num_stages=4` risks shared-memory exhaustion on sm_7x):
+The Turing backward launch uses tested `(32, 64, 64, 32)` blocks and one
+pipeline stage. The larger valid tile improves backward throughput on the
+tested FP16 workloads while staying within the T4's 64 KiB shared-memory limit.
+The `(64, 32)` M1/N1 ordering is not valid for this kernel's dK/dV
+static divisibility constraint; `(32, 64, 64, 32)` was the best-performing
+valid tested alternative. Dense backward dQ and dK/dV now compile-time
+specialize the optional softcap, ALiBi, and window branches.
 
-| N_CTX | mode | before (ms) | after (ms) | speedup |
-|------:|:----:|------------:|-----------:|--------:|
-|  1024 | cfwd |       2.197 |      2.095 |    1.05 |
-|  2048 | cfwd |       6.036 |      5.949 |    1.02 |
-|  2048 | fwd  |       8.939 |      8.507 |    1.05 |
-|  4096 | cfwd |      18.984 |     17.965 |    1.06 |
-|  4096 | fwd  |      31.741 |     30.597 |    1.04 |
-|  2048 | cbwd |      22.936 |     24.020 |    0.96 |
-|  4096 | cbwd |      77.760 |     79.848 |    0.97 |
+### Forward effective throughput (TFLOP/s)
 
-Forward gains 1–6%; the backward config widening was reverted (it caused a 2–4% regression). All numbers are contention-inflated (~1.2× the clean SDPA-comparison baselines above), so relative gains are real but modest.
+| B | S | H | D | Causal | Project | PyTorch SDPA |
+|---:|---:|---:|---:|:---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 18.28 | 16.36 |
+| 4 | 1024 | 32 | 64 | no | 29.11 | 10.65 |
+| 4 | 2048 | 32 | 64 | yes | 18.50 | 11.67 |
+| 8 | 512 | 32 | 64 | no | 18.74 | 10.83 |
+| 2 | 1024 | 64 | 64 | yes | 14.82 | 9.45 |
+| 8 | 512 | 16 | 128 | yes | 12.45 | 11.27 |
+| 1 | 4096 | 16 | 64 | yes | 24.45 | 11.18 |
 
-**SageBwd-style INT8 attention (Turing sm_75 only, experimental)** — `flash_attn_func_int8` runs the forward QK^T on the INT8 tensor cores, keeping PV and the backward dP in FP16 per SageBwd (arXiv 2505.11594, 2603.02170). Forward accuracy is now solid (0.5–2% rel err vs the fp16 path, causal and noncausal; the earlier scale-folding bug that caused 25–63% error is fixed). Speed remains the blocker: measured ~0.66× fp16 end-to-end — Triton 3.2's INT8 MMA gives only ~6% raw dot speedup at the kernel's 64×64×64 blocks on T4, and in-kernel quantize/dequantize overhead cancels it. The backward is functional but its FP16 S-recompute, normalized by the INT8 forward's LSE, degrades with sequence length (~2× gradient error at S=64, worse at S=256). Matching SageBwd's full accuracy/speed requires two-level P scaling, K-smoothing, and fused quantization; `flash_attn_func_int8` is an experimental building block, not a performance path. Volta (sm_70) has no INT8 tensor cores and falls back to fp16.
+### Backward effective throughput (TFLOP/s)
 
-## Acknowledgements
+| B | S | H | D | Causal | Project | PyTorch SDPA |
+|---:|---:|---:|---:|:---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 5.02 | 3.88 |
+| 4 | 1024 | 32 | 64 | no | 10.42 | 7.21 |
+| 4 | 2048 | 32 | 64 | yes | 6.01 | 6.71 |
+| 8 | 512 | 32 | 64 | no | 5.27 | 4.03 |
+| 2 | 1024 | 64 | 64 | yes | 5.21 | 3.62 |
+| 8 | 512 | 16 | 128 | yes | 2.33 | 4.88 |
+| 1 | 4096 | 16 | 64 | yes | 6.22 | 6.20 |
 
-This implementation is based on the Triton attention implementation from the original Flash Attention 2 repository by TriDao and the Triton tutorial on fused attention.
+For causal attention, forward FLOPs are
+`2 * B * H * D * S * (S + 1)`; for non-causal attention they are
+`4 * B * H * D * S * S`. Effective TFLOP/s is FLOPs divided by median
+milliseconds and `1e9`.
+
+The T4 measurements use the pinned PyTorch/Triton runtime listed above.
 
 ## License
 

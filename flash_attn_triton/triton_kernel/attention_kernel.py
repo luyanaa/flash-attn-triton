@@ -55,41 +55,48 @@ def _varlen_fwd(Q, K, V, O, LSE, CU_Q, CU_K, ALIBI_SLOPES,
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     slope = tl.load(ALIBI_SLOPES + batch * H + head) if USE_ALIBI else 0.0
 
+    max_n = k_len
+    if CAUSAL:
+        # Every key block at or above this bound is fully masked.
+        max_n = tl.minimum(k_len, (tl.program_id(0) + 1) * BLOCK_M)
     for start_n in range(0, MAX_SEQLEN_K, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
-        k_valid = cols < k_len
-        key_pos = cols[None, :]
-        valid = k_valid[None, :]
-        if CAUSAL:
-            valid = valid & (q_pos[:, None] >= key_pos)
-        if WINDOW_LEFT >= 0:
-            valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
-            valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
-        k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
-        v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
-        k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
-        v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
-        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale
-        if USE_ALIBI:
-            scores -= slope * tl.abs(q_pos[:, None] - key_pos)
-        if SOFTCAP > 0:
-            scores = SOFTCAP * (2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0)
-        scores = scores * 1.4426950408889634
-        scores = tl.where(valid & q_valid[:, None], scores, -float('inf'))
-        m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
-        p = tl.math.exp2(scores - m_ij[:, None])
-        p = tl.where(valid & q_valid[:, None], p, 0.0)
-        l_ij = tl.sum(p, axis=1)
-        if USE_DROPOUT:
-            rng = tl.rand(dropout_seed, (q_start + rows[:, None]) * MAX_SEQLEN_K + cols[None, :])
-            p = tl.where(rng > dropout_p, p / (1.0 - dropout_p), 0.0)
-        alpha = tl.where(m_i == -float('inf'), 0.0, tl.math.exp2(m_i - m_ij))
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
-        m_i = m_ij
+        if not CAUSAL or start_n < max_n:
+            cols = start_n + tl.arange(0, BLOCK_N)
+            k_valid = cols < k_len
+            key_pos = cols[None, :]
+            valid = k_valid[None, :]
+            if CAUSAL:
+                valid = valid & (q_pos[:, None] >= key_pos)
+            if WINDOW_LEFT >= 0:
+                valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
+            # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
+            # Directly loading K as [head_dim, block_n] preserves correctness.
+            k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+            v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
+            k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+            v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
+            scores = tl.dot(q, k_t, out_dtype=tl.float32) * sm_scale
+            if USE_ALIBI:
+                scores -= slope * tl.abs(q_pos[:, None] - key_pos)
+            if SOFTCAP > 0:
+                scores = SOFTCAP * (2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0)
+            scores = scores * 1.4426950408889634
+            scores = tl.where(valid & q_valid[:, None], scores, -float('inf'))
+            m_ij = tl.maximum(m_i, tl.max(scores, axis=1))
+            p = tl.math.exp2(scores - m_ij[:, None])
+            p = tl.where(valid & q_valid[:, None], p, 0.0)
+            l_ij = tl.sum(p, axis=1)
+            if USE_DROPOUT:
+                rng = tl.rand(dropout_seed, (q_start + rows[:, None]) * MAX_SEQLEN_K + cols[None, :])
+                p = tl.where(rng > dropout_p, p / (1.0 - dropout_p), 0.0)
+            alpha = tl.where(m_i == -float('inf'), 0.0, tl.math.exp2(m_i - m_ij))
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
+            m_i = m_ij
 
-    lse = m_i + tl.math.log2(l_i)
+    lse = tl.where(l_i > 0, m_i + tl.math.log2(l_i), -float('inf'))
     out = acc / tl.where(l_i[:, None] > 0, l_i[:, None], 1.0)
     out_ptr = O + (q_start + rows[:, None]) * stride_ot + head * HEAD_DIM + d[None, :]
     lse_ptr = LSE + (q_start + rows) * H + head
@@ -98,7 +105,7 @@ def _varlen_fwd(Q, K, V, O, LSE, CU_Q, CU_K, ALIBI_SLOPES,
 
 
 @triton.jit
-def _varlen_bwd(Q, K, V, O, DO, DQ, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
+def _varlen_bwd(Q, K, V, O, DO, DQ, LSE, CU_Q, CU_K, ALIBI_SLOPES,
                 sm_scale, dropout_p, dropout_seed,
                 stride_qt, stride_kt, stride_vt, stride_ot,
                 H, H_KV, MAX_SEQLEN_Q, MAX_SEQLEN_K,
@@ -115,7 +122,8 @@ def _varlen_bwd(Q, K, V, O, DO, DQ, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
     k_end = tl.load(CU_K + batch + 1)
     q_len = q_end - q_start
     k_len = k_end - k_start
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    pid_m = tl.program_id(0)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     q_valid = rows < q_len
     # Keep backward masking identical to the SDPA-aligned forward pass.
     q_pos = rows
@@ -132,59 +140,151 @@ def _varlen_bwd(Q, K, V, O, DO, DQ, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
     slope = tl.load(ALIBI_SLOPES + batch * H + head) if USE_ALIBI else 0.0
     dq = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
 
+    max_n = k_len
+    if CAUSAL:
+        # Every key block at or above this bound is fully masked.
+        max_n = tl.minimum(k_len, (pid_m + 1) * BLOCK_M)
     for start_n in range(0, MAX_SEQLEN_K, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
-        k_valid = cols < k_len
-        key_pos = cols[None, :]
-        valid = k_valid[None, :]
-        if CAUSAL:
-            valid = valid & (q_pos[:, None] >= key_pos)
-        if WINDOW_LEFT >= 0:
-            valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
-            valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
-        k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
-        v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
-        k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
-        v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
-        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale
-        if USE_ALIBI:
-            scores -= slope * tl.abs(q_pos[:, None] - key_pos)
-        if SOFTCAP > 0:
-            cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0
-            scores = SOFTCAP * cap_tanh
-            cap_grad = 1.0 - cap_tanh * cap_tanh
-        else:
-            cap_grad = tl.zeros_like(scores) + 1.0
-        p = tl.math.exp2(scores * 1.4426950408889634 - lse[:, None])
-        p = tl.where(lse[:, None] == -float('inf'), 0.0, p)
-        p = tl.where(valid & q_valid[:, None], p, 0.0)
-        if USE_DROPOUT:
-            rng = tl.rand(dropout_seed, (q_start + rows[:, None]) * MAX_SEQLEN_K + cols[None, :])
-            p = tl.where(rng > dropout_p, p / (1.0 - dropout_p), 0.0)
-        dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
-        ds = p * (dp - delta[:, None]) * cap_grad
-        dq += tl.dot(ds, k, out_dtype=tl.float32)
-        dk = tl.dot(tl.trans(ds), q, out_dtype=tl.float32) * sm_scale
-        dv = tl.dot(tl.trans(p), do, out_dtype=tl.float32)
-        dk_ptr = DK + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
-        dv_ptr = DV + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
-        tl.atomic_add(dk_ptr, dk.to(DK.type.element_ty), mask=k_valid[:, None])
-        tl.atomic_add(dv_ptr, dv.to(DV.type.element_ty), mask=k_valid[:, None])
+        if not CAUSAL or start_n < max_n:
+            cols = start_n + tl.arange(0, BLOCK_N)
+            k_valid = cols < k_len
+            key_pos = cols[None, :]
+            valid = k_valid[None, :]
+            if CAUSAL:
+                valid = valid & (q_pos[:, None] >= key_pos)
+            if WINDOW_LEFT >= 0:
+                valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
+            k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
+            k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+            v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
+            k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
+            k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+            v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+            scores = tl.dot(q, k_t, out_dtype=tl.float32) * sm_scale
+            if USE_ALIBI:
+                scores -= slope * tl.abs(q_pos[:, None] - key_pos)
+            if SOFTCAP > 0:
+                cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0
+                scores = SOFTCAP * cap_tanh
+                cap_grad = 1.0 - cap_tanh * cap_tanh
+            else:
+                cap_grad = tl.zeros_like(scores) + 1.0
+            p = tl.math.exp2(scores * 1.4426950408889634 - lse[:, None])
+            p = tl.where(lse[:, None] == -float('inf'), 0.0, p)
+            p = tl.where(valid & q_valid[:, None], p, 0.0)
+            if USE_DROPOUT:
+                rng = tl.rand(dropout_seed, (q_start + rows[:, None]) * MAX_SEQLEN_K + cols[None, :])
+                p = tl.where(rng > dropout_p, p / (1.0 - dropout_p), 0.0)
+            dp = tl.dot(do, v_t, out_dtype=tl.float32)
+            ds = p * (dp - delta[:, None]) * cap_grad
+            ds16 = ds.to(q.type.element_ty)
+            dq += tl.dot(ds16, k, out_dtype=tl.float32)
 
     dq_ptr = DQ + (q_start + rows[:, None]) * stride_qt + head * HEAD_DIM + d[None, :]
     tl.store(dq_ptr, (dq * sm_scale).to(DQ.type.element_ty), mask=q_valid[:, None])
 
 @triton.jit
+def _varlen_bwd_dkdv(Q, K, V, O, DO, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
+                     sm_scale, dropout_p, dropout_seed,
+                     stride_qt, stride_kt, stride_vt, stride_ot,
+                     H, H_KV, MAX_SEQLEN_Q, MAX_SEQLEN_K,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                     HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr,
+                     USE_DROPOUT: tl.constexpr, USE_ALIBI: tl.constexpr,
+                     WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
+                     GROUP_SIZE: tl.constexpr, SOFTCAP):
+    # One program owns one K/V block, batch, and KV head. Query-head groups
+    # are reduced inside the program, so every dK/dV element has one writer.
+    batch = tl.program_id(1)
+    kv_head = tl.program_id(2)
+    q_start = tl.load(CU_Q + batch)
+    q_end = tl.load(CU_Q + batch + 1)
+    k_start = tl.load(CU_K + batch)
+    k_end = tl.load(CU_K + batch + 1)
+    q_len = q_end - q_start
+    k_len = k_end - k_start
+    start_n = tl.program_id(0) * BLOCK_N
+    cols = start_n + tl.arange(0, BLOCK_N)
+    k_valid = cols < k_len
+    key_pos = cols[None, :]
+    d = tl.arange(0, HEAD_DIM)
+    k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+    v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
+    k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+    v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+    dk = tl.zeros((BLOCK_N, HEAD_DIM), tl.float32)
+    dv = tl.zeros((BLOCK_N, HEAD_DIM), tl.float32)
+
+    for head_group in range(GROUP_SIZE):
+        head = kv_head * GROUP_SIZE + head_group
+        slope = tl.load(ALIBI_SLOPES + batch * H + head) if USE_ALIBI else 0.0
+        for start_m in range(0, MAX_SEQLEN_Q, BLOCK_M):
+            rows = start_m + tl.arange(0, BLOCK_M)
+            q_valid = rows < q_len
+            q_pos = rows
+            q_ptr = Q + (q_start + rows[:, None]) * stride_qt + head * HEAD_DIM + d[None, :]
+            q_t_ptr = Q + (q_start + rows[None, :]) * stride_qt + head * HEAD_DIM + d[:, None]
+            o_ptr = O + (q_start + rows[:, None]) * stride_ot + head * HEAD_DIM + d[None, :]
+            do_ptr = DO + (q_start + rows[:, None]) * stride_ot + head * HEAD_DIM + d[None, :]
+            do_t_ptr = DO + (q_start + rows[None, :]) * stride_ot + head * HEAD_DIM + d[:, None]
+            q = tl.load(q_ptr, mask=q_valid[:, None], other=0.0)
+            q_t = tl.load(q_t_ptr, mask=q_valid[None, :], other=0.0)
+            o = tl.load(o_ptr, mask=q_valid[:, None], other=0.0)
+            do = tl.load(do_ptr, mask=q_valid[:, None], other=0.0)
+            do_t = tl.load(do_t_ptr, mask=q_valid[None, :], other=0.0)
+            delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
+            lse = tl.load(LSE + (q_start + rows) * H + head, mask=q_valid, other=0.0)
+            valid = k_valid[None, :]
+            if CAUSAL:
+                valid = valid & (q_pos[:, None] >= key_pos)
+            if WINDOW_LEFT >= 0:
+                valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
+            scores = tl.dot(q, k_t, out_dtype=tl.float32) * sm_scale
+            if USE_ALIBI:
+                scores -= slope * tl.abs(q_pos[:, None] - key_pos)
+            if SOFTCAP > 0:
+                cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (scores / SOFTCAP))) - 1.0
+                scores = SOFTCAP * cap_tanh
+                cap_grad = 1.0 - cap_tanh * cap_tanh
+            else:
+                cap_grad = tl.zeros_like(scores) + 1.0
+            p = tl.math.exp2(scores * 1.4426950408889634 - lse[:, None])
+            p = tl.where(lse[:, None] == -float('inf'), 0.0, p)
+            p = tl.where(valid & q_valid[:, None], p, 0.0)
+            if USE_DROPOUT:
+                rng = tl.rand(dropout_seed, (q_start + rows[:, None]) * MAX_SEQLEN_K + cols[None, :])
+                p = tl.where(rng > dropout_p, p / (1.0 - dropout_p), 0.0)
+            dp = tl.dot(do, v_t, out_dtype=tl.float32)
+            ds = p * (dp - delta[:, None]) * cap_grad
+            ds16 = ds.to(q.type.element_ty)
+            dk_t = tl.dot(q_t, ds16, out_dtype=tl.float32) * sm_scale
+            dv_t = tl.dot(do_t, p.to(do.type.element_ty), out_dtype=tl.float32)
+            dk += tl.trans(dk_t)
+            dv += tl.trans(dv_t)
+
+    dk_ptr = DK + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
+    dv_ptr = DV + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
+    tl.store(dk_ptr, dk.to(DK.type.element_ty), mask=k_valid[:, None])
+    tl.store(dv_ptr, dv.to(DV.type.element_ty), mask=k_valid[:, None])
+
+
+@triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     K_block_ptr, V_block_ptr,  #
-                    start_m, qk_scale,  #
+                    start_m,  #
                     dropout_p, dropout_seed,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
                     N_CTX: tl.constexpr, USE_DROPOUT: tl.constexpr,
                     SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
-                    softcap, alibi_slope, window_left, window_right):
+                    SOFTCAP: tl.constexpr, alibi_slope,
+                    WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
+                    HAS_SOFTCAP: tl.constexpr, HAS_ALIBI: tl.constexpr,
+                    HAS_WINDOW: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -197,48 +297,48 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
     dropout_scale = 1.0 / (1.0 - dropout_p) if USE_DROPOUT else 1.0
-    
+
     # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k, out_dtype=tl.float32)
-        qk = qk * qk_scale
-        if alibi_slope != 0:
+        query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
+        if HAS_ALIBI:
             key_positions = start_n + offs_n[None, :]
             qk -= alibi_slope * 1.4426950408889634 * tl.abs(
-                (offs_m + SEQ_LEN_K - SEQ_LEN_Q)[:, None] - key_positions
+                query_positions[:, None] - key_positions
             )
-        if softcap > 0:
-            qk = softcap * (2.0 / (1.0 + tl.math.exp(-2.0 * (qk / softcap))) - 1.0)
-        query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
-        window_mask = tl.full([BLOCK_M, BLOCK_N], True, tl.int1)
-        if window_left >= 0:
-            window_mask = window_mask & ((start_n + offs_n[None, :]) >= (query_positions[:, None] - window_left))
-        if window_right >= 0:
-            window_mask = window_mask & ((start_n + offs_n[None, :]) <= (query_positions[:, None] + window_right))
+        if HAS_SOFTCAP:
+            qk = SOFTCAP * (2.0 / (1.0 + tl.math.exp(-2.0 * (qk / SOFTCAP))) - 1.0)
+        if HAS_WINDOW:
+            window_mask = tl.full([BLOCK_M, BLOCK_N], True, tl.int1)
+            if WINDOW_LEFT >= 0:
+                window_mask = window_mask & ((start_n + offs_n[None, :]) >= (query_positions[:, None] - WINDOW_LEFT))
+            if WINDOW_RIGHT >= 0:
+                window_mask = window_mask & ((start_n + offs_n[None, :]) <= (query_positions[:, None] + WINDOW_RIGHT))
+        else:
+            window_mask = tl.full([BLOCK_M, BLOCK_N], True, tl.int1)
         if STAGE == 2:
             mask = query_positions[:, None] >= (start_n + offs_n[None, :])
-            mask = mask & window_mask
+            if HAS_WINDOW:
+                mask = mask & window_mask
             if SEQ_LEN_K < N_CTX:
                 mask = mask & ((start_n + offs_n[None, :]) < SEQ_LEN_K)
-            qk = qk + tl.where(mask, 0, -1.0e6)
+            qk = tl.where(mask, qk, -float('inf'))
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
+            mask = tl.full([BLOCK_M, BLOCK_N], True, tl.int1)
             if SEQ_LEN_K < N_CTX:
-                pad_mask = ((start_n + offs_n[None, :]) < SEQ_LEN_K) & window_mask
-                qk = qk + tl.where(pad_mask, 0, -1.0e6)
-                m_ij = tl.maximum(m_i, tl.max(tl.where(window_mask, qk, -1.0e6), 1))
-                qk -= m_ij[:, None]
-            else:
-                m_ij = tl.maximum(m_i, tl.max(qk, 1))
-                qk = qk - m_ij[:, None]
-        qk = tl.where(window_mask, qk, -1.0e6)
+                mask = mask & ((start_n + offs_n[None, :]) < SEQ_LEN_K)
+            if HAS_WINDOW:
+                mask = mask & window_mask
+            m_ij = tl.maximum(m_i, tl.max(tl.where(mask, qk, -float('inf')), 1))
+            qk = qk - m_ij[:, None]
         p = tl.math.exp2(qk)
-        # Keep the softmax normalization independent of dropout. Dropout is
-        # applied only to the value accumulation below.
+        p = tl.where(mask, p, 0.0)
         l_ij = tl.sum(p, 1)
 
         # -- apply dropout if specified at compile time --
@@ -254,10 +354,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
             # Generate the dropout mask using combined offsets
             rng = tl.rand(dropout_seed, combined_offsets)
             dropout_mask = rng > dropout_p
-            # Apply the dropout and scale by 1/(1-p) to maintain expected values
+            # Apply the dropout and scale by 1/(1-p)
             p = tl.where(dropout_mask, p / (1.0 - dropout_p), 0.0)
         # -- update m_i and l_i
-        alpha = tl.math.exp2(m_i - m_ij)
+        alpha = tl.where(m_i == -float('inf'), 0.0, tl.math.exp2(m_i - m_ij))
         l_i = l_i * alpha + l_ij
         # -- update output accumulator --
         acc = acc * alpha[:, None]
@@ -277,21 +377,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
 # re-tuning.
 configs = [
     triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_stages=3, num_warps=8),
     triton.Config({'BLOCK_M': 64, 'BLOCK_N': 16}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=1, num_warps=4),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
     triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
 ]
 
 
@@ -300,6 +395,21 @@ def keep(conf):
     BLOCK_N = conf.kwargs["BLOCK_N"]
     return BLOCK_M >= BLOCK_N
 
+def _device_capability():
+    return torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+
+
+def _is_volta():
+    return _device_capability() == (7, 0)
+
+
+def _forward_configs_for_device():
+    candidates = list(filter(keep, configs))
+    if _is_volta():
+        return [config for config in candidates if config.num_stages <= 2]
+    return candidates
+
+
 
 def prune_configs_by_head_dim(configs, named_args, **kwargs):
     head_dim = kwargs["HEAD_DIM"]
@@ -307,7 +417,7 @@ def prune_configs_by_head_dim(configs, named_args, **kwargs):
 
 
 @triton.autotune(
-    list(filter(keep, configs)),
+    _forward_configs_for_device(),
     key=["N_CTX", "HEAD_DIM", "STAGE", "USE_DROPOUT"],
     prune_configs_by={"early_config_prune": prune_configs_by_head_dim},
 )
@@ -325,7 +435,8 @@ def _attn_fwd(Q, K, V, sm_scale, dropout_p, dropout_seed, M, Out,  #
               USE_DROPOUT: tl.constexpr,  #
               SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
               WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
-              SOFTCAP, ALIBI_SLOPES, USE_ALIBI: tl.constexpr):
+              SOFTCAP: tl.constexpr, ALIBI_SLOPES, USE_ALIBI: tl.constexpr,
+              STORE_LSE: tl.constexpr):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -370,40 +481,50 @@ def _attn_fwd(Q, K, V, sm_scale, dropout_p, dropout_seed, M, Out,  #
         block_shape=(BLOCK_M, HEAD_DIM),
         order=(1, 0),
     )
+    # initialize offsets
     offs_m = tl.max_contiguous(tl.multiple_of(start_m * BLOCK_M + tl.arange(0, BLOCK_M), BLOCK_M), BLOCK_M)
     offs_n = tl.max_contiguous(tl.multiple_of(tl.arange(0, BLOCK_N), BLOCK_N), BLOCK_N)
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    # load scales
-    qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
+    # Pre-scale Q so every inner-loop dot avoids a repeated multiply.
+    q_scale = sm_scale * 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
+    q = (q * q_scale).to(Q.type.element_ty)
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
     if STAGE & 1:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale, dropout_p, dropout_seed,  #
+                                        start_m, dropout_p, dropout_seed,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX, USE_DROPOUT,
-                                        SEQ_LEN_K, SEQ_LEN_Q, SOFTCAP, alibi_slope, WINDOW_LEFT, WINDOW_RIGHT)
+                                        SEQ_LEN_K, SEQ_LEN_Q, SOFTCAP, alibi_slope,
+                                        WINDOW_LEFT, WINDOW_RIGHT,
+                                        HAS_SOFTCAP=SOFTCAP > 0,
+                                        HAS_ALIBI=USE_ALIBI,
+                                        HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0))
     # stage 2: on-band
     if STAGE & 2:
         # barrier makes it easier for compielr to schedule the
         # two loops independently
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
-                                        start_m, qk_scale, dropout_p, dropout_seed,  #
+                                        start_m, dropout_p, dropout_seed,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX, USE_DROPOUT,
-                                        SEQ_LEN_K, SEQ_LEN_Q, SOFTCAP, alibi_slope, WINDOW_LEFT, WINDOW_RIGHT)
-    # epilogue
-    m_i += tl.math.log2(l_i)
-    acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
+                                        SEQ_LEN_K, SEQ_LEN_Q, SOFTCAP, alibi_slope,
+                                        WINDOW_LEFT, WINDOW_RIGHT,
+                                        HAS_SOFTCAP=SOFTCAP > 0,
+                                        HAS_ALIBI=USE_ALIBI,
+                                        HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0))
+    safe_l_i = tl.where(l_i > 0, l_i, 1.0)
+    if STORE_LSE:
+        lse = tl.where(l_i > 0, m_i + tl.math.log2(l_i), -float('inf'))
+        m_ptrs = M + off_hz * N_CTX + offs_m
+        tl.store(m_ptrs, lse)
+    acc = acc / safe_l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty))
 
 
@@ -454,34 +575,44 @@ def _attn_bwd_dkdv(dk, dv,  #
                     MASK: tl.constexpr, USE_DROPOUT: tl.constexpr,
                     SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
                     WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
-                    softcap, alibi_slope):
+                    softcap, alibi_slope,
+                    HAS_SOFTCAP: tl.constexpr, HAS_ALIBI: tl.constexpr,
+                    HAS_WINDOW: tl.constexpr):
     offs_m = tl.max_contiguous(tl.multiple_of(start_m + tl.arange(0, BLOCK_M1), BLOCK_M1), BLOCK_M1)
     offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N1), BLOCK_N1), BLOCK_N1)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
+    q_ptrs = Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    q_t_ptrs = Q + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    do_t_ptrs = DO + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
     dropout_scale = 1.0 / (1.0 - dropout_p) if USE_DROPOUT else 1.0
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs)
+        q = tl.load(q_ptrs)
+        # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
+        # Load the transposed operand directly instead.
+        q_t = tl.load(q_t_ptrs)
         # Load m before computing qk to reduce pipeline stall.
         offs_m = tl.max_contiguous(tl.multiple_of(curr_m + tl.arange(0, BLOCK_M1), BLOCK_M1), BLOCK_M1)
         m = tl.load(M + offs_m)
-        qkT = tl.dot(k, qT, out_dtype=tl.float32) * (sm_scale * 1.4426950408889634)
+        qkT = tl.dot(k, q_t, out_dtype=tl.float32) * (sm_scale * 1.4426950408889634)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
-        window_mask = tl.full([BLOCK_N1, BLOCK_M1], True, tl.int1)
-        if WINDOW_LEFT >= 0:
-            window_mask = window_mask & (offs_n[:, None] >= query_positions[None, :] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
-            window_mask = window_mask & (offs_n[:, None] <= query_positions[None, :] + WINDOW_RIGHT)
-        if alibi_slope != 0:
+        if HAS_WINDOW:
+            window_mask = tl.full([BLOCK_N1, BLOCK_M1], True, tl.int1)
+            if WINDOW_LEFT >= 0:
+                window_mask = window_mask & (offs_n[:, None] >= query_positions[None, :] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                window_mask = window_mask & (offs_n[:, None] <= query_positions[None, :] + WINDOW_RIGHT)
+        else:
+            window_mask = tl.full([BLOCK_N1, BLOCK_M1], True, tl.int1)
+        if HAS_ALIBI:
             qkT -= alibi_slope * 1.4426950408889634 * tl.abs(
                 (offs_m + SEQ_LEN_K - SEQ_LEN_Q)[None, :] - offs_n[:, None]
             )
-        if softcap > 0:
+        if HAS_SOFTCAP:
             cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (qkT / softcap))) - 1.0
             qkT = softcap * cap_tanh
             cap_grad = 1.0 - cap_tanh * cap_tanh
@@ -499,6 +630,8 @@ def _attn_bwd_dkdv(dk, dv,  #
         if not MASK and SEQ_LEN_K < N_CTX:
             pad_mask = offs_n[:, None] < SEQ_LEN_K
             pT = tl.where(pad_mask & window_mask, pT, 0.0)
+        if not MASK:
+            pT = tl.where(window_mask, pT, 0.0)
             
         # Apply the same dropout mask for backward pass
         if USE_DROPOUT:
@@ -514,20 +647,24 @@ def _attn_bwd_dkdv(dk, dv,  #
             pT = tl.where(dropout_mask, pT * dropout_scale, 0.0)
             
         do = tl.load(do_ptrs)
+        # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
+        do_t = tl.load(do_t_ptrs)
         # Compute dV.
         ppT = pT.to(v.type.element_ty)
         dv += tl.dot(ppT, do, out_dtype=tl.float32)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
         # Compute dP and dS.
-        dpT = tl.dot(v, tl.trans(do), out_dtype=tl.float32)
+        dpT = tl.dot(v, do_t, out_dtype=tl.float32)
         dsT = pT * (dpT - Di[None, :]) * cap_grad
         dsT = dsT.to(Q.type.element_ty)
-        dk += tl.dot(dsT, tl.trans(qT), out_dtype=tl.float32)
+        dk += tl.dot(dsT, q, out_dtype=tl.float32)
         # Increment pointers.
         curr_m += step_m
-        qT_ptrs += step_m * stride_tok
+        q_ptrs += step_m * stride_tok
+        q_t_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
+        do_t_ptrs += step_m * stride_tok
     return dk, dv
 
 
@@ -547,12 +684,16 @@ def _attn_bwd_dq(dq, q, K, V,  #
                  MASK: tl.constexpr, USE_DROPOUT: tl.constexpr,
                  SEQ_LEN_K: tl.constexpr, SEQ_LEN_Q: tl.constexpr,
                  WINDOW_LEFT: tl.constexpr, WINDOW_RIGHT: tl.constexpr,
-                 softcap, alibi_slope):
+                 softcap, alibi_slope,
+                 HAS_SOFTCAP: tl.constexpr, HAS_ALIBI: tl.constexpr,
+                 HAS_WINDOW: tl.constexpr):
     offs_m = tl.max_contiguous(tl.multiple_of(start_m + tl.arange(0, BLOCK_M2), BLOCK_M2), BLOCK_M2)
     offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N2), BLOCK_N2), BLOCK_N2)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
-    kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
-    vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    k_ptrs = K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    k_t_ptrs = K + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
+    v_ptrs = V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    v_t_ptrs = V + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
@@ -561,22 +702,29 @@ def _attn_bwd_dq(dq, q, K, V,  #
     step_n = BLOCK_N2
     dropout_scale = 1.0 / (1.0 - dropout_p) if USE_DROPOUT else 1.0
     for blk_idx in range(num_steps):
-        kT = tl.load(kT_ptrs)
-        vT = tl.load(vT_ptrs)
-        qk = tl.dot(q, kT, out_dtype=tl.float32) * (1.4426950408889634 * sm_scale)
+        k = tl.load(k_ptrs)
+        # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
+        # Load K and V transposed directly instead.
+        k_t = tl.load(k_t_ptrs)
+        v = tl.load(v_ptrs)
+        v_t = tl.load(v_t_ptrs)
+        qk = tl.dot(q, k_t, out_dtype=tl.float32) * (1.4426950408889634 * sm_scale)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
         key_positions = curr_n + tl.arange(0, BLOCK_N2)
-        window_mask = tl.full([BLOCK_M2, BLOCK_N2], True, tl.int1)
-        if WINDOW_LEFT >= 0:
-            window_mask = window_mask & (key_positions[None, :] >= query_positions[:, None] - WINDOW_LEFT)
-        if WINDOW_RIGHT >= 0:
-            window_mask = window_mask & (key_positions[None, :] <= query_positions[:, None] + WINDOW_RIGHT)
-        if alibi_slope != 0:
+        if HAS_WINDOW:
+            window_mask = tl.full([BLOCK_M2, BLOCK_N2], True, tl.int1)
+            if WINDOW_LEFT >= 0:
+                window_mask = window_mask & (key_positions[None, :] >= query_positions[:, None] - WINDOW_LEFT)
+            if WINDOW_RIGHT >= 0:
+                window_mask = window_mask & (key_positions[None, :] <= query_positions[:, None] + WINDOW_RIGHT)
+        else:
+            window_mask = tl.full([BLOCK_M2, BLOCK_N2], True, tl.int1)
+        if HAS_ALIBI:
             qk -= alibi_slope * 1.4426950408889634 * tl.abs(
                 (offs_m + SEQ_LEN_K - SEQ_LEN_Q)[:, None]
                 - curr_n - tl.arange(0, BLOCK_N2)[None, :]
             )
-        if softcap > 0:
+        if HAS_SOFTCAP:
             cap_tanh = 2.0 / (1.0 + tl.math.exp(-2.0 * (qk / softcap))) - 1.0
             qk = softcap * cap_tanh
             cap_grad = 1.0 - cap_tanh * cap_tanh
@@ -595,7 +743,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
             p = tl.where(pad_mask & window_mask, p, 0.0)
         if not MASK:
             p = tl.where(window_mask, p, 0.0)
-            
         # Apply dropout mask for backward pass
         if USE_DROPOUT:
             # Create unique offsets for the dropout mask
@@ -603,24 +750,26 @@ def _attn_bwd_dq(dq, q, K, V,  #
             col_offsets = curr_n + tl.arange(0, BLOCK_N2)[None, :]
             combined_offsets = row_offsets * N_CTX + col_offsets
             
-            # Generate the dropout mask (same as in forward pass)
+            # Generate the same dropout mask as in forward pass
             rng = tl.rand(dropout_seed, combined_offsets)
             dropout_mask = rng > dropout_p
             # Apply the dropout and scale by 1/(1-p)
             p = tl.where(dropout_mask, p * dropout_scale, 0.0)
             
         # Compute dP and dS.
-        dp = tl.dot(do, vT, out_dtype=tl.float32)
+        dp = tl.dot(do, v_t, out_dtype=tl.float32)
         ds = p * (dp - Di[:, None]) * cap_grad
         ds = ds.to(K.type.element_ty)
-        # Compute dQ.
-        # Apply the softmax scale to dQ after accumulating the unscaled K product.
-        dq += tl.dot(ds, tl.trans(kT), out_dtype=tl.float32)
+        dq += tl.dot(ds, k, out_dtype=tl.float32)
         # Increment pointers.
         curr_n += step_n
-        kT_ptrs += step_n * stride_tok
-        vT_ptrs += step_n * stride_tok
+        k_ptrs += step_n * stride_tok
+        k_t_ptrs += step_n * stride_tok
+        v_ptrs += step_n * stride_tok
+        v_t_ptrs += step_n * stride_tok
     return dq
+
+
 
 
 
@@ -632,8 +781,28 @@ backward_configs = [
 ]
 
 
+def _is_turing():
+    return _device_capability() == (7, 5)
+
+
+def _backward_configs_for_device():
+    if _is_turing():
+        return [triton.Config({}, num_stages=1, num_warps=4)]
+    if _is_volta():
+        return [config for config in backward_configs if config.num_stages <= 2]
+    return backward_configs
+
+
+def _backward_block_sizes():
+    if _is_turing():
+        # BLOCK_N1 must be a multiple of BLOCK_M1 in _attn_bwd_dkdv.
+        return 32, 64, 64, 32
+    return 16, 64, 64, 16
+
+
+
 @triton.autotune(
-    backward_configs,
+    _backward_configs_for_device(),
     key=["N_CTX", "HEAD_DIM", "CAUSAL", "USE_DROPOUT"],
 )
 @triton.jit
@@ -715,7 +884,10 @@ def _attn_bwd(Q, K, V, sm_scale,
                                 WINDOW_LEFT=WINDOW_LEFT,
                                 WINDOW_RIGHT=WINDOW_RIGHT,
                                 softcap=SOFTCAP,
-                                alibi_slope=alibi_slope
+                                alibi_slope=alibi_slope,
+                                HAS_SOFTCAP=SOFTCAP > 0,
+                                HAS_ALIBI=USE_ALIBI,
+                                HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
                                 )
         start_m += num_steps * MASK_BLOCK_M1
         num_steps = (N_CTX - start_m) // BLOCK_M1
@@ -739,7 +911,10 @@ def _attn_bwd(Q, K, V, sm_scale,
                 WINDOW_LEFT=WINDOW_LEFT,
                 WINDOW_RIGHT=WINDOW_RIGHT,
                 softcap=SOFTCAP,
-                alibi_slope=alibi_slope
+                alibi_slope=alibi_slope,
+                HAS_SOFTCAP=SOFTCAP > 0,
+                HAS_ALIBI=USE_ALIBI,
+                HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
             )
     else:
         # For non-causal attention, process all blocks without masking
@@ -762,7 +937,10 @@ def _attn_bwd(Q, K, V, sm_scale,
             WINDOW_LEFT=WINDOW_LEFT,
             WINDOW_RIGHT=WINDOW_RIGHT,
             softcap=SOFTCAP,
-            alibi_slope=alibi_slope
+            alibi_slope=alibi_slope,
+            HAS_SOFTCAP=SOFTCAP > 0,
+            HAS_ALIBI=USE_ALIBI,
+            HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
         )
 
     # Store dV and dK
@@ -811,7 +989,10 @@ def _attn_bwd(Q, K, V, sm_scale,
                           WINDOW_LEFT=WINDOW_LEFT,
                           WINDOW_RIGHT=WINDOW_RIGHT,
                           softcap=SOFTCAP,
-                          alibi_slope=alibi_slope
+                          alibi_slope=alibi_slope,
+                          HAS_SOFTCAP=SOFTCAP > 0,
+                          HAS_ALIBI=USE_ALIBI,
+                          HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
                           )
         end_n -= num_steps * MASK_BLOCK_N2
         
@@ -833,7 +1014,10 @@ def _attn_bwd(Q, K, V, sm_scale,
                               WINDOW_LEFT=WINDOW_LEFT,
                               WINDOW_RIGHT=WINDOW_RIGHT,
                               softcap=SOFTCAP,
-                              alibi_slope=alibi_slope
+                              alibi_slope=alibi_slope,
+                              HAS_SOFTCAP=SOFTCAP > 0,
+                              HAS_ALIBI=USE_ALIBI,
+                              HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
                               )
     else:
         # For non-causal attention, process all tokens without masking
@@ -853,7 +1037,10 @@ def _attn_bwd(Q, K, V, sm_scale,
                           WINDOW_LEFT=WINDOW_LEFT,
                           WINDOW_RIGHT=WINDOW_RIGHT,
                           softcap=SOFTCAP,
-                          alibi_slope=alibi_slope
+                          alibi_slope=alibi_slope,
+                          HAS_SOFTCAP=SOFTCAP > 0,
+                          HAS_ALIBI=USE_ALIBI,
+                          HAS_WINDOW=(WINDOW_LEFT >= 0 or WINDOW_RIGHT >= 0),
                           )
 
     # Write back dQ
@@ -862,52 +1049,71 @@ def _attn_bwd(Q, K, V, sm_scale,
     tl.store(dq_ptrs, dq.to(DQ.type.element_ty))
 
 
+def _launch_dense_forward(
+    q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k,
+    seq_len_q, kv_heads, softcap, alibi_slopes, window_left,
+    window_right, use_alibi, *, store_lse
+):
+    head_dim_q, head_dim_k, head_dim_v = q.shape[-1], k.shape[-1], v.shape[-1]
+    assert head_dim_q == head_dim_k == head_dim_v
+    assert head_dim_k in {16, 32, 64, 128, 256}
+    out = torch.empty_like(q)
+    metadata = (
+        torch.empty(
+            (q.shape[0], q.shape[1], q.shape[2]),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        if store_lse
+        else q.new_empty((1,), dtype=torch.float32)
+    )
+    stage = 3 if causal else 1
+    use_dropout = dropout_p > 0.0
+    grid = lambda args: (
+        triton.cdiv(q.shape[2], args["BLOCK_M"]),
+        q.shape[0] * q.shape[1],
+        1,
+    )
+    _attn_fwd[grid](
+        q, k, v, sm_scale, dropout_p, dropout_seed, metadata, out,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        q.shape[0], q.shape[1], q.shape[2], kv_heads,
+        HEAD_DIM=head_dim_k,
+        STAGE=stage,
+        USE_DROPOUT=use_dropout,
+        SEQ_LEN_K=seq_len_k,
+        SEQ_LEN_Q=seq_len_q,
+        SOFTCAP=softcap * 1.4426950408889634,
+        ALIBI_SLOPES=alibi_slopes,
+        USE_ALIBI=use_alibi,
+        STORE_LSE=store_lse,
+        WINDOW_LEFT=window_left,
+        WINDOW_RIGHT=window_right,
+    )
+    return out, metadata
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right, use_alibi):
-        # shape constraints
-        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-        # when v is in float8_e5m2 it is transposed.
-        HEAD_DIM_V = v.shape[-1]
-        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
-        o = torch.empty_like(q)
-        stage = 3 if causal else 1
-        extra_kern_args = {}
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
-        ctx.grid = grid
-        
-        # Determine if we should use dropout at compile time
-        USE_DROPOUT = dropout_p > 0.0
-        
-        _attn_fwd[grid](
-            q, k, v, sm_scale, dropout_p, dropout_seed, M, o,  #
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
-            q.shape[0], q.shape[1], q.shape[2], kv_heads,  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            STAGE=stage,  #
-            USE_DROPOUT=USE_DROPOUT,  #
-            SEQ_LEN_K=seq_len_k,
-            SEQ_LEN_Q=seq_len_q,
-            SOFTCAP=softcap * 1.4426950408889634,
-            ALIBI_SLOPES=alibi_slopes,
-            USE_ALIBI=use_alibi,
-            WINDOW_LEFT=window_left,
-            WINDOW_RIGHT=window_right,
-            **extra_kern_args)
-
-        ctx.save_for_backward(q, k, v, o, M)
+    def forward(ctx, q, k, v, causal, sm_scale, dropout_p, dropout_seed,
+                seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes,
+                window_left, window_right, use_alibi):
+        o, metadata = _launch_dense_forward(
+            q, k, v, causal, sm_scale, dropout_p, dropout_seed,
+            seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes,
+            window_left, window_right, use_alibi, store_lse=True,
+        )
+        ctx.save_for_backward(q, k, v, o, metadata)
         ctx.sm_scale = sm_scale
-        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.HEAD_DIM = q.shape[-1]
         ctx.causal = causal
         ctx.dropout_p = dropout_p
         ctx.dropout_seed = dropout_seed
-        ctx.use_dropout = USE_DROPOUT
+        ctx.use_dropout = dropout_p > 0.0
         ctx.seq_len_k = seq_len_k
         ctx.seq_len_q = seq_len_q
         ctx.kv_heads = kv_heads
@@ -928,7 +1134,7 @@ class _attention(torch.autograd.Function):
         dv = torch.zeros_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         PRE_BLOCK = 128
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = _backward_block_sizes()
         BLK_SLICE_FACTOR = 1
         # Use triton.cdiv to handle non-divisible sequence lengths:
         pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
@@ -995,15 +1201,16 @@ def attention(q, k, v, causal=False, sm_scale=None, dropout_p=0.0, dropout_seed=
 
     if q.shape[2] != k.shape[2] or k.shape[2] != v.shape[2]:
         raise ValueError("The low-level attention kernel requires equal sequence lengths")
-    if q.shape[2] % 128 != 0:
-        raise ValueError("The low-level attention kernel requires sequence lengths divisible by 128")
+    if q.shape[2] % 64 != 0:
+        raise ValueError("The low-level attention kernel requires sequence lengths divisible by 64")
     if kv_heads is None:
         kv_heads = k.shape[1]
     if q.shape[1] % kv_heads != 0:
         raise ValueError("The number of query heads must be divisible by KV heads")
     if alibi_slopes is None:
-        alibi_slopes = q.new_zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
-    if use_alibi is None:
+        alibi_slopes = q.new_empty((1,), dtype=torch.float32)
+        use_alibi = False
+    elif use_alibi is None:
         use_alibi = bool(torch.any(alibi_slopes != 0))
 
     if dropout_seed is None:
@@ -1014,8 +1221,20 @@ def attention(q, k, v, causal=False, sm_scale=None, dropout_p=0.0, dropout_seed=
     if seq_len_q is None:
         seq_len_q = q.shape[2]
 
-    # Call the autograd function
-    return _attention.apply(q, k, v, causal, sm_scale, dropout_p, dropout_seed, seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes, window_left, window_right, use_alibi)
+    needs_grad = torch.is_grad_enabled() and (
+        q.requires_grad or k.requires_grad or v.requires_grad
+    )
+    if not needs_grad:
+        return _launch_dense_forward(
+            q, k, v, causal, sm_scale, dropout_p, dropout_seed,
+            seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes,
+            window_left, window_right, use_alibi, store_lse=False,
+        )[0]
+    return _attention.apply(
+        q, k, v, causal, sm_scale, dropout_p, dropout_seed,
+        seq_len_k, seq_len_q, kv_heads, softcap, alibi_slopes,
+        window_left, window_right, use_alibi,
+    )
 
 
 def _varlen_launch_options(head_dim, device):
@@ -1024,6 +1243,17 @@ def _varlen_launch_options(head_dim, device):
     num_warps = 4 if head_dim <= 64 else 8
     num_stages = 2 if major == 7 else 3
     return num_warps, num_stages
+
+
+def _varlen_backward_block_size(head_dim, device):
+    """Keep V100 variable-length backward within shared-memory limits."""
+    major, _ = torch.cuda.get_device_capability(device)
+    if major == 7:
+        if head_dim >= 256:
+            return 16
+        if head_dim >= 128:
+            return 32
+    return 64
 
 
 class _attention_varlen(torch.autograd.Function):
@@ -1073,15 +1303,16 @@ class _attention_varlen(torch.autograd.Function):
         if not do.is_contiguous():
             do = do.contiguous()
         dq = torch.empty_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        block_m = 64
-        block_n = 64
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        block_m = _varlen_backward_block_size(q.shape[-1], q.device)
+        block_n = block_m
         batch = cu_seqlens_q.numel() - 1
-        grid = (triton.cdiv(ctx.max_seqlen_q, block_m), batch, q.shape[1])
+        grid_dq = (triton.cdiv(ctx.max_seqlen_q, block_m), batch, q.shape[1])
+        grid_dkdv = (triton.cdiv(ctx.max_seqlen_k, block_n), batch, k.shape[1])
         num_warps, num_stages = _varlen_launch_options(q.shape[-1], q.device)
-        _varlen_bwd[grid](
-            q, k, v, out, do, dq, dk, dv, lse,
+        _varlen_bwd[grid_dq](
+            q, k, v, out, do, dq, lse,
             cu_seqlens_q, cu_seqlens_k, alibi_slopes,
             ctx.sm_scale, ctx.dropout_p, ctx.dropout_seed,
             q.stride(0), k.stride(0), v.stride(0), out.stride(0),
@@ -1090,6 +1321,19 @@ class _attention_varlen(torch.autograd.Function):
             CAUSAL=ctx.causal, USE_DROPOUT=ctx.use_dropout,
             USE_ALIBI=ctx.use_alibi, WINDOW_LEFT=ctx.window_left,
             WINDOW_RIGHT=ctx.window_right, SOFTCAP=ctx.softcap,
+            num_warps=num_warps, num_stages=num_stages,
+        )
+        _varlen_bwd_dkdv[grid_dkdv](
+            q, k, v, out, do, dk, dv, lse,
+            cu_seqlens_q, cu_seqlens_k, alibi_slopes,
+            ctx.sm_scale, ctx.dropout_p, ctx.dropout_seed,
+            q.stride(0), k.stride(0), v.stride(0), out.stride(0),
+            q.shape[1], k.shape[1], ctx.max_seqlen_q, ctx.max_seqlen_k,
+            BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=q.shape[-1],
+            CAUSAL=ctx.causal, USE_DROPOUT=ctx.use_dropout,
+            USE_ALIBI=ctx.use_alibi, WINDOW_LEFT=ctx.window_left,
+            WINDOW_RIGHT=ctx.window_right,
+            GROUP_SIZE=q.shape[1] // k.shape[1], SOFTCAP=ctx.softcap,
             num_warps=num_warps, num_stages=num_stages,
         )
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None

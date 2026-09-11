@@ -86,6 +86,45 @@ def test_equal_length_attention_matches_sdpa(causal):
 
 
 @pytest.mark.parametrize("causal", [False, True])
+def test_window_attention_matches_sdpa_with_gradients(causal):
+    q, k, v = _inputs(batch=1, q_len=17, k_len=17)
+    window = (3, 2)
+    positions = torch.arange(17, device=DEVICE)
+    attn_mask = torch.zeros((17, 17), device=DEVICE, dtype=q.dtype)
+    valid = (
+        (positions[None, :] >= positions[:, None] - window[0])
+        & (positions[None, :] <= positions[:, None] + window[1])
+    )
+    if causal:
+        valid &= positions[None, :] <= positions[:, None]
+    attn_mask.masked_fill_(~valid, float("-inf"))
+
+    q_impl = q.detach().clone().requires_grad_()
+    k_impl = k.detach().clone().requires_grad_()
+    v_impl = v.detach().clone().requires_grad_()
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    output_impl = flash_attn_func(
+        q_impl, k_impl, v_impl, causal=causal, window_size=window
+    )
+    output_ref = _sdpa(q_ref, k_ref, v_ref, attn_mask=attn_mask)
+    torch.testing.assert_close(output_impl, output_ref, atol=ATOL, rtol=RTOL)
+
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    grad_output = torch.randn(
+        output_impl.shape, device=DEVICE, dtype=output_impl.dtype, generator=generator
+    )
+    gradients_impl = torch.autograd.grad(
+        (output_impl * grad_output).sum(), (q_impl, k_impl, v_impl)
+    )
+    gradients_ref = torch.autograd.grad(
+        (output_ref * grad_output).sum(), (q_ref, k_ref, v_ref)
+    )
+    for gradient_impl, gradient_ref in zip(gradients_impl, gradients_ref):
+        torch.testing.assert_close(gradient_impl, gradient_ref, atol=ATOL, rtol=RTOL)
+
+@pytest.mark.parametrize("causal", [False, True])
 def test_rectangular_attention_matches_sdpa(causal):
     q, k, v = _inputs(batch=2, q_len=7, k_len=13)
     _assert_output_and_gradients_match(
