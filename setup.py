@@ -24,8 +24,8 @@ setuptools.setup(
     python_requires=">=3.11", # Python 3.11.13
     install_requires=[
         "einops",
-        "torch==2.6.0", # torch==2.8.0 (2025.10) and torch==2.5.1 (AutoDL) known to fail.
-        "triton==3.2.0", # Turing support is dropped in 3.3.
+        "torch==2.6.0", # torch==2.8.0 (2025.10) known to fail. 2.5.1+cu124 verified (with triton 3.1.0).
+        "triton==3.2.0", # Turing support is dropped in 3.3. 3.1.0 verified (with torch 2.5.1).
         "packaging",
         "pytest"
     ],

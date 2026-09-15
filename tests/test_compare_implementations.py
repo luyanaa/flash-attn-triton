@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from flash_attn_triton import flash_attn_func, flash_attn_func_cross
 from flash_attn_triton import flash_attn_varlen_func
+from flash_attn_triton.triton_kernel.attention_kernel_int8 import attention_int8
 
 
 pytestmark = pytest.mark.skipif(
@@ -21,6 +22,10 @@ pytestmark = pytest.mark.skipif(
 DEVICE = torch.device("cuda")
 ATOL = 2e-2
 RTOL = 2e-2
+# QK^T runs in INT8, so the output and every gradient derived from it carry
+# quantization error (measured up to ~5e-2 against fp16 SDPA at head dim 64).
+INT8_ATOL = 5e-2
+INT8_RTOL = 2e-2
 
 
 def _sdpa(q, k, v, causal=False, softmax_scale=None, attn_mask=None):
@@ -48,7 +53,7 @@ def _inputs(batch, q_len, k_len, heads=2, head_dim=16):
 
 
 def _assert_output_and_gradients_match(implementation, q, k, v, *, causal,
-                                       softmax_scale=None):
+                                       softmax_scale=None, atol=ATOL, rtol=RTOL):
     q_impl = q.detach().clone().requires_grad_()
     k_impl = k.detach().clone().requires_grad_()
     v_impl = v.detach().clone().requires_grad_()
@@ -62,7 +67,7 @@ def _assert_output_and_gradients_match(implementation, q, k, v, *, causal,
     output_ref = _sdpa(
         q_ref, k_ref, v_ref, causal=causal, softmax_scale=softmax_scale
     )
-    torch.testing.assert_close(output_impl, output_ref, atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(output_impl, output_ref, atol=atol, rtol=rtol)
 
     generator = torch.Generator(device=DEVICE).manual_seed(7)
     grad_output = torch.randn(output_impl.shape, device=DEVICE,
@@ -74,7 +79,7 @@ def _assert_output_and_gradients_match(implementation, q, k, v, *, causal,
         (output_ref * grad_output).sum(), (q_ref, k_ref, v_ref)
     )
     for gradient_impl, gradient_ref in zip(gradients_impl, gradients_ref):
-        torch.testing.assert_close(gradient_impl, gradient_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(gradient_impl, gradient_ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -182,6 +187,29 @@ def test_alibi_slopes_matches_sdpa_bias():
     bias = (-slopes[:, :, None, None] * (q_pos - k_pos).abs()).half()
     expected = _sdpa(q, k, v, attn_mask=bias)
     torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
+
+
+def _attention_int8_like_sdpa(q, k, v, *, causal, softmax_scale):
+    """attention_int8 takes [B, H, S, D]; the shared helpers use [B, S, H, D]."""
+    q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+    output = attention_int8(q, k, v, causal=causal, sm_scale=softmax_scale)
+    return output.transpose(1, 2)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 5)),
+    reason="the INT8 attention kernel targets Turing (sm_75)",
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_int8_attention_matches_sdpa_with_gradients(causal):
+    # Two query blocks and two key blocks per head. The backward walks both axes
+    # by block, so a dropped block offset leaves the gradients finite but wrong:
+    # the later blocks come out short and the first block absorbs every step.
+    q, k, v = _inputs(batch=2, q_len=128, k_len=128, heads=2, head_dim=64)
+    _assert_output_and_gradients_match(
+        _attention_int8_like_sdpa, q, k, v, causal=causal, softmax_scale=0.125,
+        atol=INT8_ATOL, rtol=INT8_RTOL,
+    )
 
 
 if __name__ == "__main__":

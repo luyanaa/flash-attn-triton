@@ -692,7 +692,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
     k_ptrs = K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     k_t_ptrs = K + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
-    v_ptrs = V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     v_t_ptrs = V + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
@@ -706,7 +705,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
         # Load K and V transposed directly instead.
         k_t = tl.load(k_t_ptrs)
-        v = tl.load(v_ptrs)
         v_t = tl.load(v_t_ptrs)
         qk = tl.dot(q, k_t, out_dtype=tl.float32) * (1.4426950408889634 * sm_scale)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
@@ -765,7 +763,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
         curr_n += step_n
         k_ptrs += step_n * stride_tok
         k_t_ptrs += step_n * stride_tok
-        v_ptrs += step_n * stride_tok
         v_t_ptrs += step_n * stride_tok
     return dq
 
@@ -1096,6 +1093,60 @@ def _launch_dense_forward(
     return out, metadata
 
 
+def _dense_backward(q, k, v, o, M, do, *, sm_scale, head_dim, causal, seq_len_k,
+                    seq_len_q, kv_heads, dropout_p=0.0, dropout_seed=0,
+                    softcap=0.0, alibi_slopes=None, use_alibi=False,
+                    window_left=-1, window_right=-1):
+    """Shared dense backward: direct-store dQ/dK/dV, no atomics.
+
+    Both the fp16 path and the INT8 path use this. The INT8 kernel quantizes only
+    QK^T, and this backward is fp16 throughout (as SageBwd keeps dP), so the INT8
+    path has no cheaper gradient to offer -- it previously carried its own fused
+    atomic variant that measured 2.4x slower than this one.
+    """
+    if not do.is_contiguous():
+        do = do.contiguous()
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    BATCH, N_HEAD, N_CTX = q.shape[:3]
+    PRE_BLOCK = 128
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = _backward_block_sizes()
+    BLK_SLICE_FACTOR = 1
+    pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
+    delta = torch.empty_like(M)
+    alibi = alibi_slopes.reshape(-1) if use_alibi else q.new_zeros((BATCH * N_HEAD,), dtype=torch.float32)
+    _attn_bwd_preprocess[pre_grid](
+        o, do,  #
+        delta,  #
+        BATCH, N_HEAD, N_CTX,  #
+        BLOCK_M=PRE_BLOCK, HEAD_DIM=head_dim  #
+    )
+    grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
+    _attn_bwd[grid](
+        q, k, v, sm_scale, do, dq, dk, dv,  #
+        M, delta,  #
+        dropout_p, dropout_seed,  #
+        q.stride(0), q.stride(1), k.stride(0), q.stride(2), q.stride(3),  #
+        N_HEAD, N_CTX, kv_heads,  #
+        BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
+        BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
+        BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
+        HEAD_DIM=head_dim,  #
+        USE_DROPOUT=dropout_p > 0.0,  #
+        CAUSAL=causal,      #
+        SEQ_LEN_K=seq_len_k,
+        SEQ_LEN_Q=seq_len_q,
+        WINDOW_LEFT=window_left,
+        WINDOW_RIGHT=window_right,
+        SOFTCAP=softcap * 1.4426950408889634,
+        ALIBI_SLOPES=alibi,
+        USE_ALIBI=use_alibi,
+        NATIVE_GQA=kv_heads != N_HEAD
+    )
+    return dq, dk, dv
+
+
 class _attention(torch.autograd.Function):
 
     @staticmethod
@@ -1127,52 +1178,15 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, M = ctx.saved_tensors
-        if not do.is_contiguous():
-            do = do.contiguous()
-        dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        BATCH, N_HEAD, N_CTX = q.shape[:3]
-        PRE_BLOCK = 128
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = _backward_block_sizes()
-        BLK_SLICE_FACTOR = 1
-        # Use triton.cdiv to handle non-divisible sequence lengths:
-        pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
-
-        # pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
-        delta = torch.empty_like(M)
-        alibi_slopes = ctx.alibi_slopes.reshape(-1) if ctx.use_alibi else q.new_zeros((BATCH * N_HEAD,), dtype=torch.float32)
-        _attn_bwd_preprocess[pre_grid](
-            o, do,  #
-            delta,  #
-            BATCH, N_HEAD, N_CTX,  #
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
+        dq, dk, dv = _dense_backward(
+            q, k, v, o, M, do,
+            sm_scale=ctx.sm_scale, head_dim=ctx.HEAD_DIM, causal=ctx.causal,
+            seq_len_k=ctx.seq_len_k, seq_len_q=ctx.seq_len_q,
+            kv_heads=ctx.kv_heads, dropout_p=ctx.dropout_p,
+            dropout_seed=ctx.dropout_seed, softcap=ctx.softcap,
+            alibi_slopes=ctx.alibi_slopes, use_alibi=ctx.use_alibi,
+            window_left=ctx.window_left, window_right=ctx.window_right,
         )
-        # Also update this grid calculation:
-        grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
-        # grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
-        _attn_bwd[grid](
-            q, k, v, ctx.sm_scale, do, dq, dk, dv,  #
-            M, delta,  #
-            ctx.dropout_p, ctx.dropout_seed,  #
-            q.stride(0), q.stride(1), k.stride(0), q.stride(2), q.stride(3),  #
-            N_HEAD, N_CTX, ctx.kv_heads,  #
-            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
-            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
-            USE_DROPOUT=ctx.use_dropout,  #
-            CAUSAL=ctx.causal,      #
-            SEQ_LEN_K=ctx.seq_len_k,
-            SEQ_LEN_Q=ctx.seq_len_q,
-            WINDOW_LEFT=ctx.window_left,
-            WINDOW_RIGHT=ctx.window_right,
-            SOFTCAP=ctx.softcap * 1.4426950408889634,
-            ALIBI_SLOPES=alibi_slopes,
-            USE_ALIBI=ctx.use_alibi,
-            NATIVE_GQA=ctx.kv_heads != N_HEAD
-        )
-
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 

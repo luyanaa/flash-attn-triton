@@ -38,6 +38,7 @@ out = FlashAttention()(q, k, v, causal=True)
 - Causal and non-causal masking
 - Configurable softmax scaling
 - Head dimensions 16, 32, 64, 128, and 256
+- Turing INT8 forward (`attention_int8`) with the dense FP16 backward
 
 ## Triton backend notes
 
@@ -61,6 +62,21 @@ Native GQA remains inference-only when gradients are required. Deterministic
 variable-length fallback, paged-cache reconstruction, materialized attention
 probabilities, and materialized attention bias are correctness/API paths rather
 than throughput paths.
+
+The Turing INT8 path (`attention_int8`, compute capability 7.5 only) quantizes K
+per key token in a prepass kernel and loads the INT8 keys directly, so `QK^T`
+runs on the INT8 tensor cores with FP32 accumulation. Quantizing K inside the
+query loop instead measures roughly four times more expensive than the INT8 MMA
+it feeds on this generation, because every query block redoes every key tile.
+The per-token scales are then folded into the score epilogue, so no per-tile
+quantization survives in the inner loop.
+
+PV and the entire backward stay in FP16. Triton mis-lowers an INT8 operand
+produced in-kernel on sm_75 -- `P = exp2(S - m)` reaches `tl.dot` as garbage, not
+merely slowly, on both 3.1.0 and 3.2.0 -- so neither INT8 PV nor an INT8 backward
+is reachable from here, and the gradient path is the same dense FP16 one
+described above. The head dim must be a power of two of at least 32, and
+sequence lengths must be multiples of 64, the same requirement the dense FP16 entry point imposes.
 
 Triton is the sole project-owned attention-kernel backend.
 
@@ -112,12 +128,17 @@ backward as 2x forward FLOPs. Softmax, masking, LSE, and other elementwise
 work are excluded.
 
 The Turing backward launch uses tested `(32, 64, 64, 32)` blocks and one
-pipeline stage. The larger valid tile improves backward throughput on the
-tested FP16 workloads while staying within the T4's 64 KiB shared-memory limit.
-The `(64, 32)` M1/N1 ordering is not valid for this kernel's dK/dV
-static divisibility constraint; `(32, 64, 64, 32)` was the best-performing
-valid tested alternative. Dense backward dQ and dK/dV now compile-time
-specialize the optional softcap, ALiBi, and window branches.
+pipeline stage. Backward tile dimensions are currently fixed rather than
+included in the Triton autotune configs; the single fused grid requires
+`BLOCK_M2 == BLOCK_N1` for its unmasked dQ loads. The `tl.zeros` dK/dV
+accumulators are FP32 local fragments; at D=128 they represent 64 KiB of
+logical storage, so the relevant risk is register pressure or spilling, not
+a 64 KiB shared-memory allocation. Dense backward dQ and dK/dV now
+compile-time specialize the optional softcap, ALiBi, and window branches.
+
+The forward kernel already autotunes `BLOCK_M`/`BLOCK_N`; `BLOCK_M=128` is a
+valid forward candidate. T4 D=128 measurements did not justify removing it
+globally or pinning a new stage/tile choice.
 
 ### Forward effective throughput (TFLOP/s)
 
@@ -149,6 +170,65 @@ For causal attention, forward FLOPs are
 milliseconds and `1e9`.
 
 The T4 measurements use the pinned PyTorch/Triton runtime listed above.
+
+## Benchmark: RTX 2080 Ti (INT8 vs FP16)
+
+Measured on an RTX 2080 Ti (compute capability 7.5) with PyTorch `2.5.1+cu124`
+and Triton `3.1.0`; the same code on PyTorch `2.6.0+cu126` with Triton `3.2.0`
+measured within about 10% of these numbers. Inputs are FP16. The INT8 column is
+`attention_int8`: K is quantized per key token in the prepass and `PV` stays in
+FP16. Per row, both columns come from the same run, and the FLOP model is the one
+used for the T4 tables above; forward and backward are timed separately, the
+backward on a reused graph so it measures gradient work alone.
+
+### Forward effective throughput (TFLOP/s)
+
+| B | S | H | D | Causal | FP16 | INT8 | INT8 / FP16 |
+|---:|---:|---:|---:|:---:|---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 45.66 | 44.31 | 0.97 |
+| 4 | 1024 | 32 | 64 | no | 48.84 | 53.92 | 1.10 |
+| 4 | 2048 | 32 | 64 | yes | 47.61 | 46.44 | 0.98 |
+| 8 | 512 | 32 | 64 | no | 44.86 | 43.57 | 0.97 |
+| 2 | 1024 | 64 | 64 | yes | 36.64 | 34.24 | 0.93 |
+| 8 | 512 | 16 | 128 | yes | 29.42 | 25.91 | 0.88 |
+| 1 | 4096 | 16 | 64 | yes | 45.63 | 45.14 | 0.99 |
+| 1 | 4096 | 16 | 64 | no | 45.96 | 61.16 | 1.33 |
+
+INT8 pays off once the two attention matrix multiplications dominate the per-tile
+work: 1.10x at `S=1024` and 1.33x at `S=4096` for non-causal attention. It gives
+up ground where a causal diagonal shrinks the attention work while the per-call K
+quantization stays proportional to `S`, so the prepass is not amortized, and at
+head dim 128, where the quantization and scale traffic double relative to the
+matmuls.
+
+The INT8 launch tiles are pinned by head dim and sequence length rather than
+autotuned. The candidates span 1.3-2.4x, and Triton's autotuner times each config
+once in sequence, so on a noisy device it lands on a slow tile often enough that
+results varied up to 40% run to run. `_int8_fwd_launch_config` carries the
+measured choice: a 128-row query tile at head dim 64, 64 rows otherwise. The
+128-row tile is also used only when the sequence divides by 128 -- with a partial
+row block its first half computes the wrong softmax denominator, which a masked
+tail does not repair (64, 192 and 320 diverge against an fp32 reference while
+128, 256 and 512 do not).
+
+Causal rows move more between runs than non-causal ones (down to 0.8x) because
+the causal stages leave the later query blocks with more work than the early
+ones, so the result depends on how the blocks land across SMs.
+
+### Backward effective throughput (TFLOP/s)
+
+Both paths run the same dense FP16 gradient kernels, so there is one column:
+
+| B | S | H | D | Causal | Backward |
+|---:|---:|---:|---:|:---:|---:|
+| 4 | 512 | 32 | 64 | no | 22.4 |
+| 4 | 1024 | 32 | 64 | no | 23.9 |
+| 4 | 2048 | 32 | 64 | yes | 23.9 |
+| 8 | 512 | 32 | 64 | no | 21.5 |
+| 2 | 1024 | 64 | 64 | yes | 21.5 |
+| 8 | 512 | 16 | 128 | yes | 10.3 |
+| 1 | 4096 | 16 | 64 | yes | 24.7 |
+| 1 | 4096 | 16 | 64 | no | 24.8 |
 
 ## License
 
