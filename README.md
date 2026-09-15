@@ -151,13 +151,27 @@ stream where the MMA alone is four times as dense.
 
 ## Benchmark: Tesla T4
 
-Measured on a Kaggle Tesla T4 (14.56 GiB) with PyTorch `2.6.0+cu124`,
-CUDA `12.4`, and Triton `3.2.0`. Inputs are FP16. Each timing is the
-median of CUDA-event measurements after warmup (20 forward iterations or
-12 backward iterations). The effective FLOP model counts the two attention
-matrix multiplications, uses the logical sequence length, and treats
-backward as 2x forward FLOPs. Softmax, masking, LSE, and other elementwise
-work are excluded.
+Measured on a Kaggle Tesla T4 (14.56 GiB) with PyTorch `2.5.1+cu124`,
+CUDA `12.4`, and Triton `3.1.0`, the same runtime stack as the RTX 2080 Ti
+table below. Inputs are FP16, the INT8 column runs the Turing
+`mma.m16n8k32` path, and the PyTorch column is
+`torch.nn.functional.scaled_dot_product_attention` on the same tensors.
+Each timing is the best of five CUDA-event batches (15 forward iterations
+or 2 backward iterations per batch) after warmup. The effective FLOP model
+counts the two attention matrix multiplications, uses the logical sequence
+length, and treats backward as 2x forward FLOPs. Softmax, masking, LSE, and
+other elementwise work are excluded.
+
+All three columns are measured in one process, because Kaggle T4 instances
+are shared and throttle: two runs of this same revision spread 1.0-1.5x on
+most rows and up to 2.6x on the small-tile rows (`2/1024/64/64` and
+`8/512/16/128`, whose programs finish in tens of microseconds). Row-to-row
+forward differences inside that band are not meaningful, which is why the
+numbers here are not compared row by row against earlier revisions. The two
+comparisons that survive the spread are Project-vs-SDPA within a row, and
+the backward: its rows sit 1.4-2.1x above the previous table (six of seven
+rows; `4/1024/32/64` non-causal is unchanged), a gap that holds across three
+independent runs whose own backward spread is 1.0-1.3x.
 
 The Turing backward launch uses tested `(32, 64, 64, 32)` blocks and one
 pipeline stage. Backward tile dimensions are currently fixed rather than
@@ -174,34 +188,50 @@ globally or pinning a new stage/tile choice.
 
 ### Forward effective throughput (TFLOP/s)
 
-| B | S | H | D | Causal | Project | PyTorch SDPA |
-|---:|---:|---:|---:|:---:|---:|---:|
-| 4 | 512 | 32 | 64 | no | 18.28 | 16.36 |
-| 4 | 1024 | 32 | 64 | no | 29.11 | 10.65 |
-| 4 | 2048 | 32 | 64 | yes | 18.50 | 11.67 |
-| 8 | 512 | 32 | 64 | no | 18.74 | 10.83 |
-| 2 | 1024 | 64 | 64 | yes | 14.82 | 9.45 |
-| 8 | 512 | 16 | 128 | yes | 12.45 | 11.27 |
-| 1 | 4096 | 16 | 64 | yes | 24.45 | 11.18 |
+| B | S | H | D | Causal | Project | INT8 | PyTorch SDPA |
+|---:|---:|---:|---:|:---:|---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 24.15 | 18.02 | 12.14 |
+| 4 | 1024 | 32 | 64 | no | 22.43 | 21.87 | 11.79 |
+| 4 | 2048 | 32 | 64 | yes | 21.25 | 18.61 | 11.47 |
+| 8 | 512 | 32 | 64 | no | 20.56 | 17.37 | 10.80 |
+| 2 | 1024 | 64 | 64 | yes | 14.95 | 14.74 | 10.32 |
+| 8 | 512 | 16 | 128 | yes | 19.24 | 10.56 | 9.02 |
+| 1 | 4096 | 16 | 64 | yes | 22.95 | 20.61 | 11.75 |
+| 1 | 4096 | 16 | 64 | no | 22.24 | 27.15 | 12.21 |
 
 ### Backward effective throughput (TFLOP/s)
 
-| B | S | H | D | Causal | Project | PyTorch SDPA |
-|---:|---:|---:|---:|:---:|---:|---:|
-| 4 | 512 | 32 | 64 | no | 5.02 | 3.88 |
-| 4 | 1024 | 32 | 64 | no | 10.42 | 7.21 |
-| 4 | 2048 | 32 | 64 | yes | 6.01 | 6.71 |
-| 8 | 512 | 32 | 64 | no | 5.27 | 4.03 |
-| 2 | 1024 | 64 | 64 | yes | 5.21 | 3.62 |
-| 8 | 512 | 16 | 128 | yes | 2.33 | 4.88 |
-| 1 | 4096 | 16 | 64 | yes | 6.22 | 6.20 |
+The INT8 path runs the same dense FP16 gradient kernels as the FP16 path
+(see the 2080 Ti section), so its column tracks FP16 and differs only by
+measurement spread.
+
+| B | S | H | D | Causal | Project | INT8 | PyTorch SDPA |
+|---:|---:|---:|---:|:---:|---:|---:|---:|
+| 4 | 512 | 32 | 64 | no | 10.69 | 10.43 | 7.40 |
+| 4 | 1024 | 32 | 64 | no | 10.59 | 10.35 | 6.96 |
+| 4 | 2048 | 32 | 64 | yes | 8.12 | 10.06 | 6.34 |
+| 8 | 512 | 32 | 64 | no | 9.26 | 9.13 | 6.40 |
+| 2 | 1024 | 64 | 64 | yes | 9.07 | 9.26 | 5.56 |
+| 8 | 512 | 16 | 128 | yes | 5.56 | 4.64 | 5.38 |
+| 1 | 4096 | 16 | 64 | yes | 11.64 | 10.68 | 6.87 |
+| 1 | 4096 | 16 | 64 | no | 11.13 | 11.08 | 7.71 |
+
+INT8 is at or below FP16 on every forward row except the longest non-causal
+shape (`1/4096/16/64`, 1.22x), which matches the 2080 Ti table below: K's
+quantization is hoisted out of the query loop, so the prepass is amortised
+only by long non-causal work. On a 40-SM T4 the small shapes pay
+proportionally more for that prepass than they do on a 68-SM 2080 Ti, which
+is why the INT8/FP16 ratios here are consistently lower.
 
 For causal attention, forward FLOPs are
 `2 * B * H * D * S * (S + 1)`; for non-causal attention they are
-`4 * B * H * D * S * S`. Effective TFLOP/s is FLOPs divided by median
-milliseconds and `1e9`.
+`4 * B * H * D * S * S`. Effective TFLOP/s is FLOPs divided by the measured
+batch time and `1e9`.
 
-The T4 measurements use the pinned PyTorch/Triton runtime listed above.
+The T4 measurements use the pinned PyTorch/Triton runtime listed above. On
+that stack the repository's test file (`14 passed`, including the INT8 path
+on a Turing part) and the 19-entry-point public API smoke suite both pass on
+the same T4 session that produced these tables.
 
 ## Benchmark: RTX 2080 Ti (INT8 vs FP16)
 
@@ -212,6 +242,18 @@ measured within about 10% of these numbers. Inputs are FP16. The INT8 column is
 FP16. Per row, both columns come from the same run, and the FLOP model is the one
 used for the T4 tables above; forward and backward are timed separately, the
 backward on a reused graph so it measures gradient work alone.
+
+INT8 touches one of the six attention matrix multiplications in a
+forward-plus-backward step: forward `QK^T` runs INT8, while `dP`, `PV` and the
+entire backward stay FP16 (`SageBwd` keeps `dP` in FP16, so
+`_attention_int8.backward` reuses the dense FP16 kernel). Under the FLOP model
+above the INT8-eligible slice is therefore one sixth of the total work, and
+even at Turing's 2x INT8 tensor-core rate the end-to-end ceiling is about
+1.09x. Converting the measured per-phase numbers into end-to-end gains gives
+0.98-1.06x on the 2080 Ti and 0.92-1.03x on the T4, the best case being the
+`1/4096/16/64` non-causal row (forward 1.33x on the 2080 Ti, 1.22x on the T4).
+The lever that would move this is the backward: its `QK^T` recompute has the
+same shape the forward accelerates and is still FP16 here.
 
 ### Forward effective throughput (TFLOP/s)
 
