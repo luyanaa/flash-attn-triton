@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_attn_triton import flash_attn_func, flash_attn_func_cross
-from flash_attn_triton import flash_attn_varlen_func
+from flash_attn_triton import flash_attn_qkvpacked_func, flash_attn_varlen_func
 from flash_attn_triton.triton_kernel.attention_kernel_int8 import attention_int8
 
 
@@ -175,6 +175,29 @@ def test_cross_attention_bias_matches_sdpa():
                             dtype=torch.float16, generator=generator) * 0.1
     output = flash_attn_func_cross(q, k, v, attn_bias=attn_bias)
     expected = _sdpa(q, k, v, attn_mask=attn_bias)
+    torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_non_contiguous_inputs_match_sdpa():
+    # Slices of a packed buffer, i.e. the geometry flash_attn_qkvpacked_func
+    # hands over: the head-major token stride has a 3x gap. The wrapper used to
+    # normalise contiguity only when gradients were required, so inference on
+    # input like this silently returned the wrong output.
+    q, k, v = _inputs(batch=2, q_len=128, k_len=128)
+    qs, ks, vs = torch.stack((q, k, v), dim=2).unbind(dim=2)
+    assert not qs.is_contiguous() and not ks.is_contiguous() and not vs.is_contiguous()
+    output = flash_attn_func(qs, ks, vs)
+    expected = _sdpa(q, k, v)
+    torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_qkvpacked_matches_sdpa():
+    # unpacking the packed layout yields strided slices, which is the shape of
+    # input that exposed the missing contiguity normalisation.
+    q, k, v = _inputs(batch=2, q_len=128, k_len=128)
+    qkv = torch.stack((q, k, v), dim=2)
+    output = flash_attn_qkvpacked_func(qkv, causal=True)
+    expected = _sdpa(q, k, v, causal=True)
     torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
 
 

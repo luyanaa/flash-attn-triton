@@ -270,12 +270,24 @@ class _attention_int8(torch.autograd.Function):
 def attention_int8(q, k, v, causal=False, sm_scale=None, seq_len_k=None, seq_len_q=None):
     """INT8 flash attention (Turing sm_75 only). q,k,v: [B, H, S, D]."""
     head_dim = q.shape[-1]
+    if not q.is_cuda:
+        raise ValueError("The INT8 kernel requires CUDA tensors")
+    if torch.cuda.get_device_capability(q.device) != (7, 5):
+        raise ValueError(
+            "The INT8 kernel requires Turing (compute capability 7.5); other GPUs "
+            "have no matching INT8 tensor-core path here, use the fp16 entry point"
+        )
     if head_dim < 32 or head_dim & (head_dim - 1):
         raise ValueError(
             "The INT8 kernel requires a power-of-two head dim of at least 32"
         )
     if q.shape[2] % 64:
         raise ValueError("The INT8 kernel requires sequence lengths divisible by 64")
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        raise ValueError(
+            "The INT8 kernel requires contiguous inputs; its backward addresses "
+            "K/V with Q's strides and a strided input silently gives wrong results"
+        )
     if q.shape[2] != k.shape[2] or k.shape[2] != v.shape[2]:
         raise ValueError("The INT8 kernel requires equal sequence lengths")
     if sm_scale is None:

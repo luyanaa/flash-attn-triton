@@ -192,6 +192,16 @@ def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
     needs_grad = torch.is_grad_enabled() and (
         q.requires_grad or k.requires_grad or v.requires_grad
     )
+    # The dense kernel only handles the head-major layouts this wrapper produces:
+    # a transposed view of a contiguous [B, S, H, D] tensor, or a contiguous
+    # head-major one. Any other stride pattern silently returns the wrong output
+    # -- the slices flash_attn_qkvpacked_func builds measure 0.6-1.0 absolute
+    # error against SDPA, and a non-unit head-dim stride gives inf -- so
+    # normalise before the transpose. contiguous() is free when the input already
+    # is, so the common path pays nothing.
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     q = q.transpose(1, 2)  # [batch, heads, seq_len, head_dim]
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)

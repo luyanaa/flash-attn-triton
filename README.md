@@ -53,6 +53,23 @@ use safe normalization and write `-inf` LSE for empty rows. Variable-length
 backward uses matching operand dtypes for Triton matrix products on pre-Ampere
 targets.
 
+Dense forward guards both of its dense writes against a partial tail block. The
+tile width need not divide the sequence -- the entry point requires only a
+multiple of 64, while the forward autotune set contains 128-row tiles -- and an
+unguarded block-pointer store writes those out-of-range rows over the start of
+the same head's output, which silently corrupts the first rows of every head.
+
+Inputs are made contiguous before the head-major transpose, on every call rather
+than only when gradients are required. The dense kernel is correct only for the
+two head-major layouts this wrapper produces -- a transposed view of a contiguous
+tensor, or a contiguous head-major one -- and any other stride pattern returns
+silently wrong output: the slices of a packed buffer that
+`flash_attn_qkvpacked_func` unpacks measured 0.6 to 7.1 absolute error against
+SDPA, and a non-unit head-dim stride produced `inf`. Normalizing is free for
+contiguous input, so the dense path is unaffected; unpacking a packed buffer
+costs one copy per tensor (packed forward on a V100: 21.7 TFLOP/s against 28.2
+before, for a correct result instead of a wrong one).
+
 The public dense gradient path uses direct dK/dV stores. Packed variable-length
 backward now uses separate dQ and dK/dV grids, so `tl.atomic_add` remains only
 in the low-level native-GQA path, where it preserves grouped-head accumulation
@@ -75,8 +92,9 @@ PV and the entire backward stay in FP16. Triton mis-lowers an INT8 operand
 produced in-kernel on sm_75 -- `P = exp2(S - m)` reaches `tl.dot` as garbage, not
 merely slowly, on both 3.1.0 and 3.2.0 -- so neither INT8 PV nor an INT8 backward
 is reachable from here, and the gradient path is the same dense FP16 one
-described above. The head dim must be a power of two of at least 32, and
-sequence lengths must be multiples of 64, the same requirement the dense FP16 entry point imposes.
+described above. Its inputs must be contiguous, its head dim a power of two of at
+least 32, and its sequence lengths multiples of 64; it validates all three rather
+than relying on the kernel, whose backward addresses K/V with Q's strides.
 
 Triton is the sole project-owned attention-kernel backend.
 
@@ -90,32 +108,46 @@ the CUTLASS forward/backward operators.
 The Volta path now prunes fully masked causal key blocks in packed
 variable-length attention, specializes optional score features at compile
 time, pre-scales Q for dense forward, and excludes 3-stage dense configs.
+The Project columns were re-measured on the current revision; the xFormers
+column dates from the earlier revision, so it understates the current margin.
+The backward block size for Volta is 32 rows, which measured 1.20x (S=1024,
+non-causal) to 1.25x (S=2048, causal) over the previous 16-row tiles.
+
+Volta reaches `mma.sync.aligned.m8n8k4` through Triton (MMAv1 -- an fp16
+accumulator does not even compile, `f32.f16.f16.f32` is hardcoded), so a V100 SM
+must issue 2 MMA per clock to reach its 113 TFLOP/s peak, half of its four
+schedulers' issue slots, against 0.5 MMA per clock (0.125 slots) on Turing. A
+pure dot loop does reach 97.7 TFLOP/s (86% of peak) with register-resident
+operands, but the forward kernel in these tables runs at 31-39 TFLOP/s, about
+56% of the best tile it can use (`BLOCK_N` is capped at `HEAD_DIM`). The gap is
+that issue bandwidth: the same softmax, mask and fragment-load work shares a
+stream where the MMA alone is four times as dense.
 
 ### Forward effective throughput (TFLOP/s)
 
 | B | S | H | D | Causal | Project | xFormers CUTLASS |
 |---:|---:|---:|---:|:---:|---:|---:|
-| 4 | 512 | 32 | 64 | no | 20.00 | 16.71 |
-| 4 | 1024 | 32 | 64 | no | 32.06 | 25.08 |
-| 4 | 2048 | 32 | 64 | yes | 33.55 | 24.63 |
-| 8 | 512 | 32 | 64 | no | 27.15 | 21.47 |
-| 2 | 1024 | 64 | 64 | yes | 22.74 | 17.14 |
-| 8 | 512 | 16 | 128 | yes | 16.61 | 16.15 |
-| 1 | 4096 | 16 | 64 | no | 35.45 | 25.32 |
-| 1 | 4096 | 16 | 64 | yes | 29.12 | 21.40 |
+| 4 | 512 | 32 | 64 | no | 34.20 | 16.71 |
+| 4 | 1024 | 32 | 64 | no | 37.56 | 25.08 |
+| 4 | 2048 | 32 | 64 | yes | 36.56 | 24.63 |
+| 8 | 512 | 32 | 64 | no | 35.59 | 21.47 |
+| 2 | 1024 | 64 | 64 | yes | 31.56 | 17.14 |
+| 8 | 512 | 16 | 128 | yes | 23.00 | 16.15 |
+| 1 | 4096 | 16 | 64 | no | 39.23 | 25.32 |
+| 1 | 4096 | 16 | 64 | yes | 30.13 | 21.40 |
 
 ### Backward effective throughput (TFLOP/s)
 
 | B | S | H | D | Causal | Project | xFormers CUTLASS |
 |---:|---:|---:|---:|:---:|---:|---:|
-| 4 | 512 | 32 | 64 | no | 11.77 | 11.13 |
-| 4 | 1024 | 32 | 64 | no | 17.08 | 14.23 |
-| 4 | 2048 | 32 | 64 | yes | 17.76 | 14.09 |
-| 8 | 512 | 32 | 64 | no | 15.08 | 12.67 |
-| 2 | 1024 | 64 | 64 | yes | 14.69 | 11.34 |
-| 8 | 512 | 16 | 128 | yes | 10.99 | 9.49 |
-| 1 | 4096 | 16 | 64 | no | 16.94 | 15.58 |
-| 1 | 4096 | 16 | 64 | yes | 16.77 | 13.47 |
+| 4 | 512 | 32 | 64 | no | 19.70 | 11.13 |
+| 4 | 1024 | 32 | 64 | no | 23.12 | 14.23 |
+| 4 | 2048 | 32 | 64 | yes | 22.65 | 14.09 |
+| 8 | 512 | 32 | 64 | no | 21.29 | 12.67 |
+| 2 | 1024 | 64 | 64 | yes | 20.10 | 11.34 |
+| 8 | 512 | 16 | 128 | yes | 14.50 | 9.49 |
+| 1 | 4096 | 16 | 64 | no | 22.78 | 15.58 |
+| 1 | 4096 | 16 | 64 | yes | 22.20 | 13.47 |
 
 ## Benchmark: Tesla T4
 
