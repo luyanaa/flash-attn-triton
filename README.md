@@ -88,13 +88,16 @@ it feeds on this generation, because every query block redoes every key tile.
 The per-token scales are then folded into the score epilogue, so no per-tile
 quantization survives in the inner loop.
 
-PV and the entire backward stay in FP16. Triton mis-lowers an INT8 operand
-produced in-kernel on sm_75 -- `P = exp2(S - m)` reaches `tl.dot` as garbage, not
-merely slowly, on both 3.1.0 and 3.2.0 -- so neither INT8 PV nor an INT8 backward
-is reachable from here, and the gradient path is the same dense FP16 one
-described above. Its inputs must be contiguous, its head dim a power of two of at
-least 32, and its sequence lengths multiples of 64; it validates all three rather
-than relying on the kernel, whose backward addresses K/V with Q's strides.
+PV and backward use FP16 operands with FP32 dot accumulation; backward casts dS
+to the input element type before dQ/dK. A local repro on stock Triton 3.1.0
+showed standalone loaded/generated INT8 dots are exact, while an INT8 operand
+generated from an MMA/softmax chain is mispacked by the SM75 register-to-dot
+shortcut. TTGIR contains the conversion; the failure is in lowering. The local
+Triton source patch materializes that conversion through shared memory and adds
+a regression test. PV stays FP16 until the patch and a scaled INT8 PV path pass
+end-to-end validation. The entry point validates equal contiguous inputs,
+power-of-two D >= 32, and sequence lengths divisible by 64; its backward
+addresses K/V using Q's strides.
 
 Triton is the sole project-owned attention-kernel backend.
 
@@ -243,17 +246,23 @@ FP16. Per row, both columns come from the same run, and the FLOP model is the on
 used for the T4 tables above; forward and backward are timed separately, the
 backward on a reused graph so it measures gradient work alone.
 
-INT8 touches one of the six attention matrix multiplications in a
-forward-plus-backward step: forward `QK^T` runs INT8, while `dP`, `PV` and the
-entire backward stay FP16 (`SageBwd` keeps `dP` in FP16, so
-`_attention_int8.backward` reuses the dense FP16 kernel). Under the FLOP model
-above the INT8-eligible slice is therefore one sixth of the total work, and
-even at Turing's 2x INT8 tensor-core rate the end-to-end ceiling is about
-1.09x. Converting the measured per-phase numbers into end-to-end gains gives
-0.98-1.06x on the 2080 Ti and 0.92-1.03x on the T4, the best case being the
-`1/4096/16/64` non-causal row (forward 1.33x on the 2080 Ti, 1.22x on the T4).
-The lever that would move this is the backward: its `QK^T` recompute has the
-same shape the forward accelerates and is still FP16 here.
+The simplified FLOP model counts six canonical matrix-multiplication roles:
+forward QK^T/PV and backward dP/dV/dQ/dK. Only forward QK^T uses INT8; PV and
+backward use FP16 operands with FP32 dot accumulators, and backward casts dS to
+the input element type before dQ/dK. `_attention_int8.backward` reuses the dense
+backward kernel.
+
+This six-role model omits recomputation in this implementation: both
+`_attn_bwd_dkdv` and `_attn_bwd_dq` recompute QK^T and dP in their separate
+backward passes. For full non-causal attention that gives nine source-level
+attention dot products (two forward, four dK/dV, three dQ). If one equally
+costly dot were 2x faster, the idealized dot-only ceiling for one forward INT8
+dot is 9/8.5, or about 1.06x; K quantization, softmax, and launch costs lower
+it. The measured per-phase numbers give 0.98-1.06x end-to-end on the 2080 Ti
+and 0.92-1.03x on the T4, with the best case `1/4096/16/64` non-causal
+(forward 1.33x on the 2080 Ti, 1.22x on the T4). The next performance lever is
+the repeated backward QK^T work, which remains FP16 and needs its own
+quantization and precision validation.
 
 ### Forward effective throughput (TFLOP/s)
 

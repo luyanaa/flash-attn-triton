@@ -71,11 +71,15 @@ def _varlen_fwd(Q, K, V, O, LSE, CU_Q, CU_K, ALIBI_SLOPES,
                 valid = valid & (key_pos >= q_pos[:, None] - WINDOW_LEFT)
             if WINDOW_RIGHT >= 0:
                 valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
+            # Legacy V100 workaround (commented out for comparison):
             # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
             # Directly loading K as [head_dim, block_n] preserves correctness.
-            k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+            # k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
             v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
-            k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+            # k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+            k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
+            k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
+            k_t = tl.trans(k)
             v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
             scores = tl.dot(q, k_t, out_dtype=tl.float32) * sm_scale
             if USE_ALIBI:
@@ -157,11 +161,16 @@ def _varlen_bwd(Q, K, V, O, DO, DQ, LSE, CU_Q, CU_K, ALIBI_SLOPES,
             if WINDOW_RIGHT >= 0:
                 valid = valid & (key_pos <= q_pos[:, None] + WINDOW_RIGHT)
             k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
-            k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
-            v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
+            # Legacy direct-transpose pointer loads retained for comparison:
+            # k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+            # v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
+            v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
             k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
-            k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
-            v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+            # k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+            # v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+            k_t = tl.trans(k)
+            v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
+            v_t = tl.trans(v)
             scores = tl.dot(q, k_t, out_dtype=tl.float32) * sm_scale
             if USE_ALIBI:
                 scores -= slope * tl.abs(q_pos[:, None] - key_pos)
@@ -210,10 +219,17 @@ def _varlen_bwd_dkdv(Q, K, V, O, DO, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
     k_valid = cols < k_len
     key_pos = cols[None, :]
     d = tl.arange(0, HEAD_DIM)
-    k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
-    v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
-    k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
-    v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+    # Legacy direct-transpose K/V loads retained for comparison:
+    # k_t_ptr = K + (k_start + cols[None, :]) * stride_kt + kv_head * HEAD_DIM + d[:, None]
+    # v_t_ptr = V + (k_start + cols[None, :]) * stride_vt + kv_head * HEAD_DIM + d[:, None]
+    # k_t = tl.load(k_t_ptr, mask=k_valid[None, :], other=0.0)
+    # v_t = tl.load(v_t_ptr, mask=k_valid[None, :], other=0.0)
+    k_ptr = K + (k_start + cols[:, None]) * stride_kt + kv_head * HEAD_DIM + d[None, :]
+    v_ptr = V + (k_start + cols[:, None]) * stride_vt + kv_head * HEAD_DIM + d[None, :]
+    k = tl.load(k_ptr, mask=k_valid[:, None], other=0.0)
+    k_t = tl.trans(k)
+    v = tl.load(v_ptr, mask=k_valid[:, None], other=0.0)
+    v_t = tl.trans(v)
     dk = tl.zeros((BLOCK_N, HEAD_DIM), tl.float32)
     dv = tl.zeros((BLOCK_N, HEAD_DIM), tl.float32)
 
@@ -225,15 +241,17 @@ def _varlen_bwd_dkdv(Q, K, V, O, DO, DK, DV, LSE, CU_Q, CU_K, ALIBI_SLOPES,
             q_valid = rows < q_len
             q_pos = rows
             q_ptr = Q + (q_start + rows[:, None]) * stride_qt + head * HEAD_DIM + d[None, :]
-            q_t_ptr = Q + (q_start + rows[None, :]) * stride_qt + head * HEAD_DIM + d[:, None]
+            # q_t_ptr = Q + (q_start + rows[None, :]) * stride_qt + head * HEAD_DIM + d[:, None]
             o_ptr = O + (q_start + rows[:, None]) * stride_ot + head * HEAD_DIM + d[None, :]
             do_ptr = DO + (q_start + rows[:, None]) * stride_ot + head * HEAD_DIM + d[None, :]
-            do_t_ptr = DO + (q_start + rows[None, :]) * stride_ot + head * HEAD_DIM + d[:, None]
+            # do_t_ptr = DO + (q_start + rows[None, :]) * stride_ot + head * HEAD_DIM + d[:, None]
             q = tl.load(q_ptr, mask=q_valid[:, None], other=0.0)
-            q_t = tl.load(q_t_ptr, mask=q_valid[None, :], other=0.0)
+            # q_t = tl.load(q_t_ptr, mask=q_valid[None, :], other=0.0)
+            q_t = tl.trans(q)
             o = tl.load(o_ptr, mask=q_valid[:, None], other=0.0)
             do = tl.load(do_ptr, mask=q_valid[:, None], other=0.0)
-            do_t = tl.load(do_t_ptr, mask=q_valid[None, :], other=0.0)
+            # do_t = tl.load(do_t_ptr, mask=q_valid[None, :], other=0.0)
+            do_t = tl.trans(do)
             delta = tl.sum(o.to(tl.float32) * do.to(tl.float32), axis=1)
             lse = tl.load(LSE + (q_start + rows) * H + head, mask=q_valid, other=0.0)
             valid = k_valid[None, :]
@@ -587,9 +605,9 @@ def _attn_bwd_dkdv(dk, dv,  #
     offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N1), BLOCK_N1), BLOCK_N1)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
     q_ptrs = Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    q_t_ptrs = Q + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
+    # q_t_ptrs = Q + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    do_t_ptrs = DO + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
+    # do_t_ptrs = DO + offs_k[:, None] * stride_d + offs_m[None, :] * stride_tok
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
@@ -597,9 +615,11 @@ def _attn_bwd_dkdv(dk, dv,  #
     dropout_scale = 1.0 / (1.0 - dropout_p) if USE_DROPOUT else 1.0
     for blk_idx in range(num_steps):
         q = tl.load(q_ptrs)
+        # Legacy V100 workaround (commented out for comparison):
         # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
         # Load the transposed operand directly instead.
-        q_t = tl.load(q_t_ptrs)
+        # q_t = tl.load(q_t_ptrs)
+        q_t = tl.trans(q)
         # Load m before computing qk to reduce pipeline stall.
         offs_m = tl.max_contiguous(tl.multiple_of(curr_m + tl.arange(0, BLOCK_M1), BLOCK_M1), BLOCK_M1)
         m = tl.load(M + offs_m)
@@ -652,8 +672,10 @@ def _attn_bwd_dkdv(dk, dv,  #
             pT = tl.where(dropout_mask, pT * dropout_scale, 0.0)
             
         do = tl.load(do_ptrs)
+        # Legacy V100 workaround (commented out for comparison):
         # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
-        do_t = tl.load(do_t_ptrs)
+        # do_t = tl.load(do_t_ptrs)
+        do_t = tl.trans(do)
         # Compute dV.
         ppT = pT.to(v.type.element_ty)
         dv += tl.dot(ppT, do, out_dtype=tl.float32)
@@ -667,9 +689,9 @@ def _attn_bwd_dkdv(dk, dv,  #
         # Increment pointers.
         curr_m += step_m
         q_ptrs += step_m * stride_tok
-        q_t_ptrs += step_m * stride_tok
+        # q_t_ptrs += step_m * stride_tok
         do_ptrs += step_m * stride_tok
-        do_t_ptrs += step_m * stride_tok
+        # do_t_ptrs += step_m * stride_tok
     return dk, dv
 
 
@@ -696,8 +718,10 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_n = tl.max_contiguous(tl.multiple_of(start_n + tl.arange(0, BLOCK_N2), BLOCK_N2), BLOCK_N2)
     offs_k = tl.max_contiguous(tl.multiple_of(tl.arange(0, HEAD_DIM), HEAD_DIM), HEAD_DIM)
     k_ptrs = K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    k_t_ptrs = K + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
-    v_t_ptrs = V + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
+    v_ptrs = V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
+    # Legacy V100 workaround pointers retained for comparison:
+    # k_t_ptrs = K + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
+    # v_t_ptrs = V + offs_k[:, None] * stride_d + offs_n[None, :] * stride_tok
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
@@ -709,8 +733,11 @@ def _attn_bwd_dq(dq, q, K, V,  #
         k = tl.load(k_ptrs)
         # Avoid pointer-loaded FP16 transposes in tl.dot on V100.
         # Load K and V transposed directly instead.
-        k_t = tl.load(k_t_ptrs)
-        v_t = tl.load(v_t_ptrs)
+        # k_t = tl.load(k_t_ptrs)
+        # v_t = tl.load(v_t_ptrs)
+        k_t = tl.trans(k)
+        v = tl.load(v_ptrs)
+        v_t = tl.trans(v)
         qk = tl.dot(q, k_t, out_dtype=tl.float32) * (1.4426950408889634 * sm_scale)
         query_positions = offs_m + SEQ_LEN_K - SEQ_LEN_Q
         key_positions = curr_n + tl.arange(0, BLOCK_N2)
@@ -767,8 +794,9 @@ def _attn_bwd_dq(dq, q, K, V,  #
         # Increment pointers.
         curr_n += step_n
         k_ptrs += step_n * stride_tok
-        k_t_ptrs += step_n * stride_tok
-        v_t_ptrs += step_n * stride_tok
+        v_ptrs += step_n * stride_tok
+        # k_t_ptrs += step_n * stride_tok
+        # v_t_ptrs += step_n * stride_tok
     return dq
 
 
@@ -1107,10 +1135,11 @@ def _dense_backward(q, k, v, o, M, do, *, sm_scale, head_dim, causal, seq_len_k,
                     window_left=-1, window_right=-1):
     """Shared dense backward: direct-store dQ/dK/dV, no atomics.
 
-    Both the fp16 path and the INT8 path use this. The INT8 kernel quantizes only
-    QK^T, and this backward is fp16 throughout (as SageBwd keeps dP), so the INT8
-    path has no cheaper gradient to offer -- it previously carried its own fused
-    atomic variant that measured 2.4x slower than this one.
+    Both FP16 and INT8 forward paths reuse this backward. The INT8 path quantizes
+    only QK^T in forward; backward keeps input-typed operands, accumulates dots
+    in FP32, and casts dS to the input element type before dQ/dK. It therefore
+    adds no INT8 gradient acceleration; the previous fused atomic variant was
+    measured 2.4x slower than this path.
     """
     if not do.is_contiguous():
         do = do.contiguous()
